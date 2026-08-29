@@ -106,7 +106,7 @@ pub fn run_quantize(
             bail!(
                 "recipe assigns `{}` to {}, which has no ggml type and cannot go in a GGUF (its \
                  block scales are separate tensors). Target a safetensors checkpoint for that \
-                 format, or pick a GGUF-representable one (MXFP4 is the only block-float that fits).",
+                 format, or pick a GGUF-representable one (`MXFP4` or `NVFP4_GGUF`).",
                 t.name,
                 ggml_type_name(dst_type)
             );

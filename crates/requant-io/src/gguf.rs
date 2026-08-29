@@ -557,7 +557,7 @@ fn write_value(buf: &mut Vec<u8>, v: &GgufValue) {
 }
 
 /// Block geometry for a ggml type: `(elements_per_block, bytes_per_block)`.
-/// Float types use block=1; legacy quants use block=32; k-quants use super-block=256.
+/// Float types use block=1; standard quants use their GGML block; K/I/T quants use 256.
 /// This is pure format geometry (the source of truth for packed sizes) — the quant crate
 /// depends on it so tensor sizing stays in one place.
 pub fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
@@ -573,12 +573,15 @@ pub fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         7  => Some((32, 24)),   // Q5_1: d(2) + m(2) + qh[4] + qs[16]
         8  => Some((32, 34)),   // Q8_0: d(2) + qs[32]
         9  => Some((32, 36)),   // Q8_1: d(2) + m(2) + qs[32]
+        41 => Some((128, 18)),  // Q1_0: d(2) + sign bits[16]
+        42 => Some((64, 18)),   // Q2_0: d(2) + two-bit quants[16]
         // k-quants: super-block = 256 (QK_K). bytes per 256-elem super-block:
         10 => Some((256, 84)),   // Q2_K:  scales[16] + qs[64]   + d(2) + dmin(2)
         11 => Some((256, 110)),  // Q3_K:  hmask[32] + qs[64] + scales[12] + d(2)
         12 => Some((256, 144)),  // Q4_K:  d(2) + dmin(2) + scales[12] + qs[128]
         13 => Some((256, 176)),  // Q5_K:  d(2) + dmin(2) + scales[12] + qh[32] + qs[128]
         14 => Some((256, 210)),  // Q6_K:  qs[128] + qh[64] + scales[16] + d(2)
+        15 => Some((256, 292)),  // Q8_K:  d(f32) + qs[256] + bsums[16](i16), internal in ggml
         // i-quants (codebook family). Block = 256 (QK_K) except IQ4_NL (block 32 = QK4_NL).
         // bytes-per-256 verified against the block_iq* structs in ggml-common.h:
         16 => Some((256, 66)),   // IQ2_XXS: d(2) + qs[64] (16×uint16 codebook idx)
@@ -590,8 +593,12 @@ pub fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         22 => Some((256, 82)),   // IQ2_S:   d(2) + qs[64] + scales[16]
         23 => Some((256, 136)),  // IQ4_XS:  d(2) + d2(2) + qh[4] + qs[128]
         29 => Some((256, 56)),   // IQ1_M:   qs[32] + qh[16] + scales[8]  (no super-block d)
+        // Balanced ternary formats.
+        34 => Some((256, 54)),   // TQ1_0: qs[48] + qh[4] + d(2)
+        35 => Some((256, 66)),   // TQ2_0: qs[64] + d(2)
         // MXFP4 (ggml): block_mxfp4 { e(1) + qs[16] } = 4.25 bpw.
         crate::blockfloat::GGML_TYPE_MXFP4 => Some((32, 17)),
+        crate::blockfloat::GGML_TYPE_NVFP4 => Some((64, 36)),
         // ---- requant-internal block-float ids (no ggml type; see blockfloat.rs) ----
         // These report their *fully loaded* cost, i.e. element bytes plus the sidecar scale
         // bytes, because that is the number the byte-budget search must spend. The bytes are not
@@ -659,7 +666,12 @@ pub fn ggml_type_name(ggml_type: u32) -> String {
         22 => "IQ2_S".into(),
         23 => "IQ4_XS".into(),
         29 => "IQ1_M".into(),
+        34 => "TQ1_0".into(),
+        35 => "TQ2_0".into(),
         crate::blockfloat::GGML_TYPE_MXFP4 => "MXFP4".into(),
+        crate::blockfloat::GGML_TYPE_NVFP4 => "NVFP4_GGUF".into(),
+        41 => "Q1_0".into(),
+        42 => "Q2_0".into(),
         crate::blockfloat::RQ_TYPE_NVFP4 => "NVFP4".into(),
         crate::blockfloat::RQ_TYPE_MXFP4_OCP => "MXFP4_OCP".into(),
         crate::blockfloat::RQ_TYPE_MXFP8_E4M3 => "MXFP8".into(),

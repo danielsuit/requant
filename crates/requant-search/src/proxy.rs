@@ -65,9 +65,13 @@ pub const IQUANT_LADDER: &[Bits] = &[
 /// when the recipe floors experts at an i-quant and the allocator should be free to upgrade across
 /// the codebook/k-quant boundary (e.g. IQ3_S -> IQ4_XS -> Q4_K -> Q5_K).
 pub const FULL_LADDER: &[Bits] = &[
+    Bits::Q1_0,
     Bits::IQ1_S,
+    Bits::TQ1_0,
     Bits::IQ1_M,
     Bits::IQ2_XXS,
+    Bits::TQ2_0,
+    Bits::Q2_0,
     Bits::IQ2_XS,
     Bits::IQ2_S,
     Bits::Q2_K,

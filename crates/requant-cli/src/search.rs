@@ -378,7 +378,7 @@ mod tests {
         // The full ladder is cheapest-first by bits-per-weight, so the first rung is the sub-2-bit
         // IQ1_S and a later rung is the 8.5-bpw Q8_0.
         let full = resolve_ladder(Some("full")).unwrap();
-        assert_eq!(full.first(), Some(&Bits::IQ1_S));
+        assert_eq!(full.first(), Some(&Bits::Q1_0));
         assert_eq!(full.last(), Some(&Bits::Q8_0));
         // Explicit lists are sorted cheapest-first regardless of the order given.
         let l = resolve_ladder(Some("Q8_0,Q4_K,Q6_K")).unwrap();

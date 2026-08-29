@@ -24,9 +24,8 @@ pub enum StatKind {
     ActScale,
 }
 
-/// Quantization method selecting a Quantizer family. v1 only ships `Kquant` and `Legacy`
-/// (both exercised through `quantize_tensor`); the enum is here so recipes can name a method
-/// even before GPTQ/AWQ land.
+/// Quantization method selecting an optimization algorithm. RTN/K-quant scale search are live;
+/// GPTQ/AWQ remain reserved recipe vocabulary for future kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantMethod {
     Rtn,
@@ -44,6 +43,8 @@ pub enum Bits {
     F32,
     F16,
     BF16,
+    Q1_0,
+    Q2_0,
     Q8_0,
     Q8_1,
     Q6_K,
@@ -56,6 +57,8 @@ pub enum Bits {
     Q3_K,
     Q2_K,
     Q8_K,
+    TQ1_0,
+    TQ2_0,
     /// i-quant codebook family (ggml types 16..23, 29). imatrix-driven; the formats that make
     /// sub-3-bit expert quantization practical.
     IQ1_S,
@@ -67,11 +70,14 @@ pub enum Bits {
     IQ3_S,
     IQ4_NL,
     IQ4_XS,
-    /// MXFP4 in ggml's `block_mxfp4` layout — the only block-float format that fits in a GGUF.
+    /// MXFP4 in ggml's `block_mxfp4` layout.
     MXFP4,
     /// NVFP4 (E2M1 × 16 + E4M3 block scale + fp32 tensor scale). safetensors only; this is the
     /// format Blackwell's FP4 tensor cores actually consume.
     NVFP4,
+    /// Current ggml's self-contained NVFP4 block (GGUF type 40), without ModelOpt's tensor-level
+    /// `weight_scale_2` sidecar.
+    NVFP4_GGUF,
     /// MXFP8 (E4M3 × 32 + E8M0 block scale).
     MXFP8,
     /// Dense FP8 e4m3 with a per-output-channel scale.
@@ -87,12 +93,15 @@ impl Bits {
         match self {
             Bits::MXFP4 => requant_io::GGML_TYPE_MXFP4,
             Bits::NVFP4 => requant_io::RQ_TYPE_NVFP4,
+            Bits::NVFP4_GGUF => requant_io::GGML_TYPE_NVFP4,
             Bits::MXFP8 => requant_io::RQ_TYPE_MXFP8_E4M3,
             Bits::FP8_E4M3 => requant_io::RQ_TYPE_FP8_E4M3,
             Bits::FP8_E5M2 => requant_io::RQ_TYPE_FP8_E5M2,
             Bits::F32 => 0,
             Bits::F16 => 1,
             Bits::BF16 => 30,
+            Bits::Q1_0 => 41,
+            Bits::Q2_0 => 42,
             Bits::Q8_0 => 8,
             Bits::Q8_1 => 9,
             Bits::Q6_K => 14,
@@ -105,6 +114,8 @@ impl Bits {
             Bits::Q3_K => 11,
             Bits::Q2_K => 10,
             Bits::Q8_K => 15,
+            Bits::TQ1_0 => 34,
+            Bits::TQ2_0 => 35,
             Bits::IQ1_S => 19,
             Bits::IQ1_M => 29,
             Bits::IQ2_XXS => 16,
@@ -136,6 +147,8 @@ impl Bits {
             Bits::F32 => "F32",
             Bits::F16 => "F16",
             Bits::BF16 => "BF16",
+            Bits::Q1_0 => "Q1_0",
+            Bits::Q2_0 => "Q2_0",
             Bits::Q8_0 => "Q8_0",
             Bits::Q8_1 => "Q8_1",
             Bits::Q6_K => "Q6_K",
@@ -148,6 +161,8 @@ impl Bits {
             Bits::Q3_K => "Q3_K",
             Bits::Q2_K => "Q2_K",
             Bits::Q8_K => "Q8_K",
+            Bits::TQ1_0 => "TQ1_0",
+            Bits::TQ2_0 => "TQ2_0",
             Bits::IQ1_S => "IQ1_S",
             Bits::IQ1_M => "IQ1_M",
             Bits::IQ2_XXS => "IQ2_XXS",
@@ -159,6 +174,7 @@ impl Bits {
             Bits::IQ4_XS => "IQ4_XS",
             Bits::MXFP4 => "MXFP4",
             Bits::NVFP4 => "NVFP4",
+            Bits::NVFP4_GGUF => "NVFP4_GGUF",
             Bits::MXFP8 => "MXFP8",
             Bits::FP8_E4M3 => "FP8_E4M3",
             Bits::FP8_E5M2 => "FP8_E5M2",
@@ -173,6 +189,8 @@ impl Bits {
             "F32" => Bits::F32,
             "F16" | "FP16" => Bits::F16,
             "BF16" => Bits::BF16,
+            "Q1_0" => Bits::Q1_0,
+            "Q2_0" => Bits::Q2_0,
             "Q8_0" => Bits::Q8_0,
             "Q8_1" => Bits::Q8_1,
             "Q6_K" => Bits::Q6_K,
@@ -185,6 +203,8 @@ impl Bits {
             "Q3_K" => Bits::Q3_K,
             "Q2_K" => Bits::Q2_K,
             "Q8_K" => Bits::Q8_K,
+            "TQ1_0" => Bits::TQ1_0,
+            "TQ2_0" => Bits::TQ2_0,
             "IQ1_S" => Bits::IQ1_S,
             "IQ1_M" => Bits::IQ1_M,
             "IQ2_XXS" => Bits::IQ2_XXS,
@@ -196,6 +216,7 @@ impl Bits {
             "IQ4_XS" => Bits::IQ4_XS,
             "MXFP4" => Bits::MXFP4,
             "NVFP4" => Bits::NVFP4,
+            "NVFP4_GGUF" | "GGML_NVFP4" => Bits::NVFP4_GGUF,
             "MXFP8" => Bits::MXFP8,
             "FP8" | "FP8_E4M3" => Bits::FP8_E4M3,
             "FP8_E5M2" => Bits::FP8_E5M2,
@@ -203,18 +224,21 @@ impl Bits {
         })
     }
 
-    /// Inverse of `to_ggml_type` for the named variants. Returns `None` for ids with no named
-    /// `Bits` (e.g. some i-quant ids not yet in the enum).
+    /// Inverse of `to_ggml_type` for the named variants. Returns `None` for scalar/integer or
+    /// otherwise unsupported ids.
     pub fn from_ggml_type(ty: u32) -> Option<Bits> {
         Some(match ty {
             requant_io::GGML_TYPE_MXFP4 => Bits::MXFP4,
             requant_io::RQ_TYPE_NVFP4 => Bits::NVFP4,
+            requant_io::GGML_TYPE_NVFP4 => Bits::NVFP4_GGUF,
             requant_io::RQ_TYPE_MXFP8_E4M3 => Bits::MXFP8,
             requant_io::RQ_TYPE_FP8_E4M3 => Bits::FP8_E4M3,
             requant_io::RQ_TYPE_FP8_E5M2 => Bits::FP8_E5M2,
             0 => Bits::F32,
             1 => Bits::F16,
             30 => Bits::BF16,
+            41 => Bits::Q1_0,
+            42 => Bits::Q2_0,
             8 => Bits::Q8_0,
             9 => Bits::Q8_1,
             14 => Bits::Q6_K,
@@ -227,6 +251,8 @@ impl Bits {
             11 => Bits::Q3_K,
             10 => Bits::Q2_K,
             15 => Bits::Q8_K,
+            34 => Bits::TQ1_0,
+            35 => Bits::TQ2_0,
             16 => Bits::IQ2_XXS,
             17 => Bits::IQ2_XS,
             18 => Bits::IQ3_XXS,
@@ -785,6 +811,24 @@ bits = "Q4_K"
             assert_eq!(Bits::from_name(b.name()).unwrap(), b, "{} name round-trip", b.name());
             let got = b.bpw().expect("bpw");
             assert!((got - bpw).abs() < 1e-9, "{} bpw {} != {}", b.name(), got, bpw);
+        }
+    }
+
+    #[test]
+    fn current_ggml_standard_ternary_and_internal_k_types_round_trip() {
+        let cases = [
+            (Bits::Q1_0, 41, 1.125),
+            (Bits::TQ1_0, 34, 1.6875),
+            (Bits::TQ2_0, 35, 2.0625),
+            (Bits::Q2_0, 42, 2.25),
+            (Bits::Q8_K, 15, 9.125),
+            (Bits::NVFP4_GGUF, 40, 4.5),
+        ];
+        for (b, id, bpw) in cases {
+            assert_eq!(b.to_ggml_type(), id);
+            assert_eq!(Bits::from_ggml_type(id), Some(b));
+            assert_eq!(Bits::from_name(b.name()), Some(b));
+            assert!((b.bpw().unwrap() - bpw).abs() < 1e-9, "{}", b.name());
         }
     }
 

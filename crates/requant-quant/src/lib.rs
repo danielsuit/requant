@@ -1,10 +1,12 @@
 //! requant-quant: the Quantizer trait + format-family implementations.
 //!
 //! Families shipped:
-//!   - `legacy`: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 (bit-exact ports of ggml `_ref` kernels)
-//!   - `kquant`: Q2_K..Q6_K (super-block k-quants with imatrix-weighted scale search)
+//!   - `legacy`: Q1_0, Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1
+//!   - `ternary`: TQ1_0, TQ2_0 (BitNet/TriLM balanced-ternary layouts)
+//!   - `kquant`: Q2_K..Q8_K (super-block k-quants; Q8_K is the ggml intermediate layout)
+//!   - `iquant`: IQ1..IQ4 codebook quants
 //!   - `mxfp`:   MXFP4 / NVFP4 / MXFP8 / dense FP8 (block-scaled floats; the Blackwell fast path)
-//! The trait + `StatKind` are structured so GPTQ/AWQ/i-quants can slot in later.
+//! The trait + `StatKind` are structured so GPTQ/AWQ can slot in later.
 //!
 //! Two entry points, because the two format worlds have different shapes:
 //!
@@ -19,6 +21,7 @@
 
 pub mod legacy;
 pub mod kquant;
+pub mod ternary;
 pub mod mxfp;
 pub mod iquant;
 pub mod recipe;
@@ -27,8 +30,8 @@ use anyhow::{bail, Result};
 use rayon::prelude::*;
 
 use requant_io::blockfloat::{
-    GGML_TYPE_MXFP4, RQ_TYPE_FP8_E4M3, RQ_TYPE_FP8_E5M2, RQ_TYPE_MXFP4_OCP, RQ_TYPE_MXFP8_E4M3,
-    RQ_TYPE_NVFP4,
+    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, RQ_TYPE_FP8_E4M3, RQ_TYPE_FP8_E5M2,
+    RQ_TYPE_MXFP4_OCP, RQ_TYPE_MXFP8_E4M3, RQ_TYPE_NVFP4,
 };
 
 pub use mxfp::{
@@ -70,6 +73,16 @@ pub fn quantize_tensor(
     if ggml_type == GGML_TYPE_MXFP4 {
         return mxfp::quantize_mxfp4_ggml(x, rows, cols, imatrix, &MxfpPolicy::default());
     }
+    if ggml_type == GGML_TYPE_NVFP4 {
+        return mxfp::quantize_nvfp4_ggml(x, rows, cols);
+    }
+
+    if ternary::handles(ggml_type) {
+        let row_bytes = (cols / block) * bpb;
+        let mut out = vec![0u8; rows * row_bytes];
+        ternary::quantize_rows(ggml_type, x, &mut out, rows, cols)?;
+        return Ok(out);
+    }
 
     // i-quants (codebook family). These are ggml types but have their own row driver.
     if iquant::handles(ggml_type) {
@@ -85,7 +98,7 @@ pub fn quantize_tensor(
     let mut out = vec![0u8; rows * row_bytes];
 
     // Legacy + k-quants are row-independent; parallelize across rows.
-    let is_legacy = matches!(ggml_type, 2 | 3 | 6 | 7 | 8 | 9);
+    let is_legacy = matches!(ggml_type, 2 | 3 | 6 | 7 | 8 | 9 | 41 | 42);
     if is_legacy {
         out.par_chunks_mut(row_bytes)
             .zip(x.par_chunks(cols))
@@ -112,6 +125,14 @@ pub fn dequantize_tensor(
     }
     if ggml_type == GGML_TYPE_MXFP4 {
         return mxfp::dequantize_mxfp4_ggml(bytes, rows, cols);
+    }
+    if ggml_type == GGML_TYPE_NVFP4 {
+        return mxfp::dequantize_nvfp4_ggml(bytes, rows, cols);
+    }
+    if ternary::handles(ggml_type) {
+        let mut out = vec![0f32; rows * cols];
+        ternary::dequantize_rows(ggml_type, bytes, &mut out, rows, cols)?;
+        return Ok(out);
     }
     if iquant::handles(ggml_type) {
         let mut out = vec![0f32; rows * cols];
@@ -150,7 +171,7 @@ pub fn dequantize_tensor(
         bail!("dequantize_tensor: {} bytes < needed {}", bytes.len(), rows * row_bytes);
     }
     let mut out = vec![0f32; rows * cols];
-    let is_legacy = matches!(ggml_type, 2 | 3 | 6 | 7 | 8 | 9);
+    let is_legacy = matches!(ggml_type, 2 | 3 | 6 | 7 | 8 | 9 | 41 | 42);
     if is_legacy {
         out.par_chunks_mut(cols)
             .zip(bytes.par_chunks(row_bytes))
@@ -176,7 +197,8 @@ pub fn bpw(ggml_type: u32) -> Option<f64> {
 /// output loadable by llama.cpp and size-equivalent to `llama-quantize`. The fallback table is
 /// ggml's `tensor_type_fallback` (llama-quant.cpp):
 ///
-///   Q2_K/Q3_K -> Q4_0,  Q4_K -> Q5_0,  Q5_K -> Q5_1,  Q6_K -> Q8_0
+///   Q1/Q2/TQ/Q2_K/Q3_K -> Q4_0, Q4_K -> Q5_0, Q5_K -> Q5_1,
+///   Q6_K/Q8_K/NVFP4_GGUF -> Q8_0
 ///
 /// with a secondary fallback to F16 when the first fallback's block (32) *also* fails to divide
 /// `cols`. Returns `(actual_type, fell_back)`; `fell_back` is true iff a fallback was applied.
@@ -190,18 +212,20 @@ pub fn fallback_type(target_type: u32, cols: usize) -> (u32, bool) {
     }
     // Primary fallback: k-quants drop to a legacy quant; legacy quants drop straight to F16.
     let primary = match target_type {
-        10 | 11 => 2,  // Q2_K, Q3_K -> Q4_0
+        10 | 11 | 34 | 35 | 41 | 42 => 2,  // low-bit 64/128/256-block types -> Q4_0
         12 => 6,       // Q4_K -> Q5_0
         13 => 7,       // Q5_K -> Q5_1
         14 => 8,       // Q6_K -> Q8_0
+        15 => 8,       // Q8_K (internal 256-block layout) -> model Q8_0
         // Super-block i-quants (block 256) -> IQ4_NL (block 32), matching llama-quantize's
         // incompatible-shape fallback. IQ4_NL itself is block 32; if 32 still doesn't divide
         // cols the secondary fallback below drops to F16.
         16 | 17 | 18 | 19 | 21 | 22 | 23 | 29 => 20, // IQ2/IQ3/IQ1/IQ4_XS -> IQ4_NL
-        // Block-float families fall back to dense FP8, whose "block" is a single element and so
-        // always divides. Falling back from FP4 to F16 would quadruple the tensor and blow the
-        // budget that motivated FP4 in the first place; FP8 keeps the dense-path floor intact.
-        GGML_TYPE_MXFP4 | RQ_TYPE_MXFP4_OCP | RQ_TYPE_NVFP4 | RQ_TYPE_MXFP8_E4M3 => RQ_TYPE_FP8_E4M3,
+        // GGUF fallbacks must remain real GGML types. The sidecar/checkpoint-only formats can
+        // fall back to dense FP8 because their caller retains the grouped tensor structure.
+        GGML_TYPE_MXFP4 => F16,
+        GGML_TYPE_NVFP4 => 8, // Q8_0, then F16 if the row is not even 32-aligned
+        RQ_TYPE_MXFP4_OCP | RQ_TYPE_NVFP4 | RQ_TYPE_MXFP8_E4M3 => RQ_TYPE_FP8_E4M3,
         _ => F16,      // legacy / other block quant that doesn't fit -> F16
     };
     // Secondary fallback: if the legacy quant's block (32) also doesn't divide cols, use F16.
@@ -418,4 +442,35 @@ pub fn unpack_float(ggml_type: u32, bytes: &[u8], n: usize) -> Result<Vec<f32>> 
     }
     out.truncate(n);
     Ok(out)
+}
+
+#[cfg(test)]
+mod current_format_tests {
+    use super::*;
+
+    #[test]
+    fn new_current_ggml_formats_quantize_and_dequantize_synthetic_rows() {
+        let rows = 2;
+        let cols = 256;
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 37 + 11) % 257) as f32 - 128.0) / 31.0)
+            .collect();
+        for ty in [41u32, 42, 34, 35, 15, GGML_TYPE_NVFP4] {
+            let packed = quantize_tensor(ty, &x, rows, cols, None).unwrap();
+            let expected = rows * (cols / requant_io::block_layout(ty).unwrap().0)
+                * requant_io::block_layout(ty).unwrap().1;
+            assert_eq!(packed.len(), expected, "{}", requant_io::ggml_type_name(ty));
+            let got = dequantize_tensor(ty, &packed, rows, cols).unwrap();
+            assert_eq!(got.len(), x.len());
+            assert!(got.iter().all(|v| v.is_finite()), "{}", requant_io::ggml_type_name(ty));
+        }
+    }
+
+    #[test]
+    fn every_new_gguf_format_has_a_gguf_safe_shape_fallback() {
+        assert_eq!(fallback_type(GGML_TYPE_NVFP4, 96), (8, true));
+        assert_eq!(fallback_type(GGML_TYPE_MXFP4, 33), (1, true));
+        assert_eq!(fallback_type(41, 64), (2, true));
+        assert_eq!(fallback_type(15, 32), (8, true));
+    }
 }

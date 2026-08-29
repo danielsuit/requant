@@ -12,10 +12,9 @@
 //! | **NVFP4** (NVIDIA) | E2M1 | 16 | E4M3 (FP8), 1 byte | per-tensor FP32 |
 //! | **FP8 dense** | E4M3 / E5M2 | 1 | per-tensor / per-channel / 2-D block | — |
 //!
-//! MXFP4 is the only one of the three that is also a *ggml* type (`GGML_TYPE_MXFP4`), so it is
-//! the only one that round-trips through a GGUF container. NVFP4 and dense FP8 live in
-//! safetensors checkpoints, where the block scales are a **separate tensor** rather than being
-//! interleaved with the element bytes — hence the `ScaleSource` indirection below.
+//! GGML now has self-contained MXFP4 and NVFP4 tensor types. The ModelOpt/vLLM NVFP4 checkpoint
+//! layout is still distinct: it and dense FP8 live in safetensors, where block/channel scales are
+//! **separate tensors** — hence the `ScaleSource` indirection below.
 //!
 //! # Nibble order is a real compatibility trap
 //!
@@ -43,6 +42,10 @@ use anyhow::{bail, Result};
 /// emitting a GGUF that uses it (`ggml_type_name()` on the C side, or the `ggml-oracle-mxfp4`
 /// test feature).
 pub const GGML_TYPE_MXFP4: u32 = 39;
+/// Current ggml's self-contained NVFP4 block (four 16-value sub-blocks per 64-value block).
+/// This is distinct from ModelOpt/vLLM NVFP4 checkpoints, which also carry a tensor-level
+/// `weight_scale_2` sidecar and use [`RQ_TYPE_NVFP4`].
+pub const GGML_TYPE_NVFP4: u32 = 40;
 
 /// Base of the requant-internal type-id namespace. These ids describe formats that have **no
 /// ggml type** — they exist so the IR, the recipe language, and the byte-budget search can name
@@ -69,7 +72,7 @@ pub fn is_gguf_type(ty: u32) -> bool {
 /// True for the FP4-family formats — the ones where a quant→quant requant has no higher-precision
 /// master underneath it (DESIGN §4). Callers use this to decide how loudly to warn.
 pub fn is_fp4_family(ty: u32) -> bool {
-    matches!(ty, GGML_TYPE_MXFP4 | RQ_TYPE_NVFP4 | RQ_TYPE_MXFP4_OCP)
+    matches!(ty, GGML_TYPE_MXFP4 | GGML_TYPE_NVFP4 | RQ_TYPE_NVFP4 | RQ_TYPE_MXFP4_OCP)
 }
 
 /// True for the FP8-family formats.
@@ -249,6 +252,46 @@ pub fn f32_to_e4m3(v: f32) -> u8 {
         }
         sign | m as u8
     }
+}
+
+/// Decode ggml's unsigned E4M3 scale. ggml's E2M1 table is doubled, so the decoded scale is
+/// halved to keep the product equal to ordinary E2M1 × E4M3.
+pub fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7f {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0x0f) as i32;
+    let man = (x & 7) as f32;
+    let raw = if exp == 0 {
+        man * exp2i(-9)
+    } else {
+        (1.0 + man / 8.0) * exp2i(exp - 7)
+    };
+    raw * 0.5
+}
+
+/// Encode a positive ggml UE4M3 scale, matching `ggml_fp32_to_ue4m3`.
+pub fn f32_to_ue4m3(mut x: f32) -> u8 {
+    if !(x > 0.0) {
+        return 0;
+    }
+    x = x.min(448.0);
+    let bits = x.to_bits();
+    let fp32_exp = ((bits >> 23) & 0xff) as i32 - 127;
+    let fp32_man = ((bits >> 20) & 7) as i32;
+    let mut exp = fp32_exp + 7;
+    if exp <= 0 {
+        return (x * 512.0 + 0.5).floor().clamp(0.0, 7.0) as u8;
+    }
+    if exp >= 15 {
+        return 0x7e;
+    }
+    let mut man = fp32_man + ((bits >> 19) & 1) as i32;
+    if man > 7 {
+        man = 0;
+        exp += 1;
+    }
+    if exp >= 15 { 0x7e } else { ((exp << 3) | man) as u8 }
 }
 
 /// Decode E5M2 (bias 15, IEEE-like: has infinities and NaN).
@@ -454,6 +497,24 @@ pub fn dequant_mxfp4_ggml_row(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantize current ggml `block_nvfp4` bytes (64 values, four UE4M3 scales, 32 E2M1 bytes).
+pub fn dequant_nvfp4_ggml_row(bytes: &[u8], out: &mut [f32]) {
+    const BLOCK: usize = 64;
+    const SUB: usize = 16;
+    const BYTES: usize = 36;
+    for (b, dst) in out.chunks_exact_mut(BLOCK).enumerate() {
+        let src = &bytes[b * BYTES..(b + 1) * BYTES];
+        for s in 0..BLOCK / SUB {
+            let d = ue4m3_to_f32(src[s]);
+            for j in 0..SUB / 2 {
+                let q = src[4 + s * (SUB / 2) + j];
+                dst[s * SUB + j] = 2.0 * e2m1_to_f32(q & 15) * d;
+                dst[s * SUB + j + SUB / 2] = 2.0 * e2m1_to_f32(q >> 4) * d;
+            }
+        }
+    }
+}
+
 /// Dequantize MXFP4 in OCP layout: element bytes and E8M0 scale bytes in separate buffers,
 /// adjacent nibble packing, block 32.
 ///
@@ -615,6 +676,18 @@ pub fn dequantize_blockfloat(
                 );
             }
         }
+        (GGML_TYPE_NVFP4, ScaleSource::Interleaved) => {
+            if cols % 64 != 0 {
+                bail!("nvfp4 gguf: cols {cols} not divisible by 64");
+            }
+            let row_bytes = cols / 64 * 36;
+            for r in 0..rows {
+                dequant_nvfp4_ggml_row(
+                    &data[r * row_bytes..r * row_bytes + row_bytes],
+                    &mut out[r * cols..r * cols + cols],
+                );
+            }
+        }
         (RQ_TYPE_MXFP4_OCP, ScaleSource::Sidecar { scales, .. }) => {
             dequant_mxfp4_ocp(data, scales, n, &mut out)?;
         }
@@ -676,6 +749,17 @@ mod tests {
         assert_eq!(e4m3_to_f32(f32_to_e4m3(1.0)), 1.0);
         assert_eq!(e4m3_to_f32(f32_to_e4m3(1000.0)), 448.0);
         assert_eq!(e4m3_to_f32(f32_to_e4m3(-1000.0)), -448.0);
+    }
+
+    #[test]
+    fn ue4m3_matches_ggml_scale_convention() {
+        for v in [2.0f32.powi(-8), 0.25, 0.5, 1.0, 3.0, 12.0, 448.0] {
+            let code = f32_to_ue4m3(v);
+            let decoded_twice = 2.0 * ue4m3_to_f32(code);
+            assert!(decoded_twice.is_finite() && decoded_twice > 0.0, "{v} -> {code:#x}");
+        }
+        assert_eq!(f32_to_ue4m3(0.0), 0);
+        assert_eq!(ue4m3_to_f32(0), 0.0);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! k-quant family (Q2_K..Q6_K) — super-block (256) quants with quantized sub-block scales
+//! k-quant family (Q2_K..Q8_K) — super-block (256) quants with quantized sub-block scales
 //! and imatrix-weighted scale search. Bit-exact port of ggml's `quantize_row_*_ref` /
 //! `dequantize_row_*` (ggml-quants.c).
 //!
@@ -1274,6 +1274,12 @@ pub fn quantize_rows(
     // ggml's `quantize_qX_K(src, dst, nrow, n_per_row, quant_weights)` reuses `quant_weights`
     // for every row. Pass the same `cols`-length slice to each row.
     match ggml_type {
+        15 => {
+            for r in 0..rows {
+                quant_q8_k_row(&x[r * cols..r * cols + cols], &mut out[r * row_bytes..r * row_bytes + row_bytes]);
+            }
+            Ok(())
+        }
         12 => {
             for r in 0..rows {
                 quant_q4_k_row(&x[r * cols..r * cols + cols], &mut out[r * row_bytes..r * row_bytes + row_bytes], imatrix);
@@ -1320,6 +1326,12 @@ pub fn dequantize_rows(
     }
     let row_bytes = (cols / QKK) * bytes_per_block(ggml_type);
     match ggml_type {
+        15 => {
+            for r in 0..rows {
+                dequant_q8_k_row(&bytes[r * row_bytes..r * row_bytes + row_bytes], &mut out[r * cols..r * cols + cols]);
+            }
+            Ok(())
+        }
         12 => {
             for r in 0..rows {
                 dequant_q4_k_row(&bytes[r * row_bytes..r * row_bytes + row_bytes], &mut out[r * cols..r * cols + cols]);
@@ -1356,11 +1368,55 @@ pub fn dequantize_rows(
 
 pub fn bytes_per_block(ggml_type: u32) -> usize {
     match ggml_type {
+        15 => 292,
         12 => Q4K_BYTES,
         13 => Q5K_BYTES,
         14 => Q6K_BYTES,
         11 => Q3K_BYTES,
         10 => Q2K_BYTES,
         _ => 0,
+    }
+}
+
+// Q8_K is stored by ggml for intermediate quantization and dot products rather than exposed as
+// a normal whole-model preset. Supporting its exact block makes quantized GGUF tensor I/O total.
+fn quant_q8_k_row(x: &[f32], out: &mut [u8]) {
+    const BYTES: usize = 292;
+    for (i, xb) in x.chunks_exact(QKK).enumerate() {
+        let ob = &mut out[i * BYTES..(i + 1) * BYTES];
+        let mut max = 0.0f32;
+        let mut amax = 0.0f32;
+        for &v in xb {
+            if v.abs() > amax {
+                amax = v.abs();
+                max = v;
+            }
+        }
+        if amax == 0.0 {
+            ob.fill(0);
+            continue;
+        }
+        let iscale = -127.0 / max;
+        ob[..4].copy_from_slice(&(1.0 / iscale).to_le_bytes());
+        for j in 0..QKK {
+            let q = nearest_int(iscale * xb[j]).min(127) as i8;
+            ob[4 + j] = q as u8;
+        }
+        for j in 0..QKK / 16 {
+            let sum: i16 = (0..16).map(|k| ob[4 + j * 16 + k] as i8 as i16).sum();
+            let off = 4 + QKK + j * 2;
+            ob[off..off + 2].copy_from_slice(&sum.to_le_bytes());
+        }
+    }
+}
+
+fn dequant_q8_k_row(bytes: &[u8], out: &mut [f32]) {
+    const BYTES: usize = 292;
+    for (i, ob) in out.chunks_exact_mut(QKK).enumerate() {
+        let ib = &bytes[i * BYTES..(i + 1) * BYTES];
+        let d = f32::from_le_bytes(ib[..4].try_into().unwrap());
+        for j in 0..QKK {
+            ob[j] = d * ib[4 + j] as i8 as f32;
+        }
     }
 }

@@ -35,7 +35,8 @@ use anyhow::{bail, Result};
 
 use requant_io::blockfloat::{
     e2m1_to_f32, e4m3_to_f32, e8m0_to_f32, f32_to_e2m1_with, f32_to_e4m3, f32_to_e8m0,
-    E2m1Rounding, E2M1_EMAX, E2M1_MAX, E4M3_MAX, GGML_TYPE_MXFP4, RQ_TYPE_FP8_E4M3,
+    E2m1Rounding, E2M1_EMAX, E2M1_MAX, E4M3_MAX, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+    RQ_TYPE_FP8_E4M3,
     RQ_TYPE_FP8_E5M2, RQ_TYPE_MXFP4_OCP, RQ_TYPE_MXFP8_E4M3, RQ_TYPE_NVFP4,
 };
 
@@ -223,6 +224,56 @@ pub fn dequantize_mxfp4_ggml(bytes: &[u8], rows: usize, cols: usize) -> Result<V
     let mut out = vec![0f32; rows * cols];
     for r in 0..rows {
         requant_io::blockfloat::dequant_mxfp4_ggml_row(
+            &bytes[r * row_bytes..(r + 1) * row_bytes],
+            &mut out[r * cols..(r + 1) * cols],
+        );
+    }
+    Ok(out)
+}
+
+/// Quantize to current ggml's self-contained NVFP4 block. Unlike the ModelOpt checkpoint layout,
+/// this format has no tensor-level `weight_scale_2`; all scale information is in each block.
+pub fn quantize_nvfp4_ggml(x: &[f32], rows: usize, cols: usize) -> Result<Vec<u8>> {
+    const BLOCK: usize = 64;
+    const SUB: usize = 16;
+    const BYTES: usize = 36;
+    if x.len() != rows * cols || cols % BLOCK != 0 {
+        bail!("NVFP4_GGUF: data/shape mismatch or cols {cols} not divisible by {BLOCK}");
+    }
+    let row_bytes = cols / BLOCK * BYTES;
+    let mut out = vec![0u8; rows * row_bytes];
+    for r in 0..rows {
+        for b in 0..cols / BLOCK {
+            let xb = &x[r * cols + b * BLOCK..r * cols + (b + 1) * BLOCK];
+            let ob = &mut out[r * row_bytes + b * BYTES..r * row_bytes + (b + 1) * BYTES];
+            for s in 0..BLOCK / SUB {
+                let sub = &xb[s * SUB..(s + 1) * SUB];
+                let amax = sub.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let e = requant_io::blockfloat::f32_to_ue4m3(amax / 6.0);
+                let d = requant_io::blockfloat::ue4m3_to_f32(e);
+                ob[s] = e;
+                for j in 0..SUB / 2 {
+                    let inv = if d > 0.0 { 0.5 / d } else { 0.0 };
+                    let q0 = f32_to_e2m1_with(sub[j] * inv, E2m1Rounding::HalfDown);
+                    let q1 = f32_to_e2m1_with(sub[j + SUB / 2] * inv, E2m1Rounding::HalfDown);
+                    ob[4 + s * (SUB / 2) + j] = q0 | (q1 << 4);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn dequantize_nvfp4_ggml(bytes: &[u8], rows: usize, cols: usize) -> Result<Vec<f32>> {
+    const BLOCK: usize = 64;
+    const BYTES: usize = 36;
+    if cols % BLOCK != 0 || bytes.len() < rows * (cols / BLOCK) * BYTES {
+        bail!("NVFP4_GGUF: invalid data/shape");
+    }
+    let row_bytes = cols / BLOCK * BYTES;
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        requant_io::blockfloat::dequant_nvfp4_ggml_row(
             &bytes[r * row_bytes..(r + 1) * row_bytes],
             &mut out[r * cols..(r + 1) * cols],
         );
@@ -636,7 +687,7 @@ impl MxFp8Checkpoint {
 pub fn handles(ggml_type: u32) -> bool {
     matches!(
         ggml_type,
-        GGML_TYPE_MXFP4
+        GGML_TYPE_MXFP4 | GGML_TYPE_NVFP4
             | RQ_TYPE_MXFP4_OCP
             | RQ_TYPE_NVFP4
             | RQ_TYPE_MXFP8_E4M3
@@ -649,6 +700,7 @@ pub fn handles(ggml_type: u32) -> bool {
 pub fn required_block(ggml_type: u32) -> Option<usize> {
     Some(match ggml_type {
         GGML_TYPE_MXFP4 | RQ_TYPE_MXFP4_OCP | RQ_TYPE_MXFP8_E4M3 => 32,
+        GGML_TYPE_NVFP4 => 64,
         RQ_TYPE_NVFP4 => 16,
         RQ_TYPE_FP8_E4M3 | RQ_TYPE_FP8_E5M2 => 1,
         _ => return None,
@@ -669,6 +721,10 @@ pub fn roundtrip(
         GGML_TYPE_MXFP4 => {
             let b = quantize_mxfp4_ggml(x, rows, cols, im, policy)?;
             dequantize_mxfp4_ggml(&b, rows, cols)
+        }
+        GGML_TYPE_NVFP4 => {
+            let q = quantize_nvfp4_ggml(x, rows, cols)?;
+            dequantize_nvfp4_ggml(&q, rows, cols)
         }
         RQ_TYPE_MXFP4_OCP => MxFp4Checkpoint::quantize(x, rows, cols, im, policy)?.dequantize(),
         RQ_TYPE_NVFP4 => NvFp4Checkpoint::quantize(x, rows, cols, im, policy)?.dequantize(),

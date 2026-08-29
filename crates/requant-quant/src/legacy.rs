@@ -1,4 +1,4 @@
-//! Legacy block quants: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1.
+//! Standard block quants: Q1_0, Q2_0, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1.
 //!
 //! Bit-exact port of ggml's `quantize_row_*_ref` / `dequantize_row_*` (ggml-quants.c).
 //! Each operates on a row split into blocks of 32. Within a block, Q4/Q5 pack the first 16
@@ -23,6 +23,8 @@ fn f16_to_f32(v: f16) -> f32 {
 /// Returns the number of bytes written (== out.len() on success).
 pub fn quantize_row(ggml_type: u32, x: &[f32], out: &mut [u8]) -> usize {
     match ggml_type {
+        41 => quant_q1_0(x, out),
+        42 => quant_q2_0(x, out),
         2 => quant_q4_0(x, out),
         3 => quant_q4_1(x, out),
         6 => quant_q5_0(x, out),
@@ -36,6 +38,8 @@ pub fn quantize_row(ggml_type: u32, x: &[f32], out: &mut [u8]) -> usize {
 /// Dequantize one row (`bytes` for the given type) into `out` (length = n elems).
 pub fn dequantize_row(ggml_type: u32, bytes: &[u8], out: &mut [f32]) {
     match ggml_type {
+        41 => dequant_q1_0(bytes, out),
+        42 => dequant_q2_0(bytes, out),
         2 => dequant_q4_0(bytes, out),
         3 => dequant_q4_1(bytes, out),
         6 => dequant_q5_0(bytes, out),
@@ -43,6 +47,84 @@ pub fn dequantize_row(ggml_type: u32, bytes: &[u8], out: &mut [f32]) {
         8 => dequant_q8_0(bytes, out),
         9 => dequant_q8_1(bytes, out),
         _ => panic!("legacy::dequantize_row: unsupported type {ggml_type}"),
+    }
+}
+
+// ============================== Q1_0 / Q2_0 ==============================
+
+// These are the current ggml reference layouts (introduced after the original legacy family).
+// Q1_0 stores one sign bit per value and the mean absolute value as its block scale.
+fn quant_q1_0(x: &[f32], out: &mut [u8]) -> usize {
+    const QK1: usize = 128;
+    const BYTES: usize = 18;
+    let nb = x.len() / QK1;
+    assert!(out.len() >= nb * BYTES);
+    for i in 0..nb {
+        let blk = &x[i * QK1..(i + 1) * QK1];
+        let d = blk.iter().map(|v| v.abs()).sum::<f32>() / QK1 as f32;
+        let off = i * BYTES;
+        out[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        out[off + 2..off + BYTES].fill(0);
+        for (j, &v) in blk.iter().enumerate() {
+            if v >= 0.0 {
+                out[off + 2 + j / 8] |= 1 << (j % 8);
+            }
+        }
+    }
+    nb * BYTES
+}
+
+fn dequant_q1_0(bytes: &[u8], out: &mut [f32]) {
+    const QK1: usize = 128;
+    const BYTES: usize = 18;
+    for i in 0..out.len() / QK1 {
+        let off = i * BYTES;
+        let d = f16_to_f32(f16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        for j in 0..QK1 {
+            let positive = (bytes[off + 2 + j / 8] >> (j % 8)) & 1 != 0;
+            out[i * QK1 + j] = if positive { d } else { -d };
+        }
+    }
+}
+
+// Q2_0 stores {-d, 0, d, 2d} in two bits, with a 64-value block.
+fn quant_q2_0(x: &[f32], out: &mut [u8]) -> usize {
+    const QK2: usize = 64;
+    const BYTES: usize = 18;
+    let nb = x.len() / QK2;
+    assert!(out.len() >= nb * BYTES);
+    for i in 0..nb {
+        let blk = &x[i * QK2..(i + 1) * QK2];
+        let d = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let off = i * BYTES;
+        out[off..off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        out[off + 2..off + BYTES].fill(0);
+        for (j, &v) in blk.iter().enumerate() {
+            // C roundf/lroundf: halfway cases go away from zero.
+            let scaled = v * id;
+            let rounded = if scaled >= 0.0 {
+                (scaled + 0.5).floor()
+            } else {
+                (scaled - 0.5).ceil()
+            } as i32;
+            let q = (rounded + 1).clamp(0, 3) as u8;
+            out[off + 2 + j / 4] |= q << (2 * (j % 4));
+        }
+    }
+    nb * BYTES
+}
+
+fn dequant_q2_0(bytes: &[u8], out: &mut [f32]) {
+    const QK2: usize = 64;
+    const BYTES: usize = 18;
+    for i in 0..out.len() / QK2 {
+        let off = i * BYTES;
+        let d = f16_to_f32(f16::from_le_bytes([bytes[off], bytes[off + 1]]));
+        for j in 0..QK2 {
+            let q = (bytes[off + 2 + j / 4] >> (2 * (j % 4))) & 3;
+            out[i * QK2 + j] = (q as i32 - 1) as f32 * d;
+        }
     }
 }
 

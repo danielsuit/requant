@@ -23,10 +23,12 @@ See the [design doc](DESIGN.md) for the full thesis, math, and architecture.
   deterministic router initialization, expected-output scaling, config migration, and a fail-loud
   `requires_training` manifest. Tests use tiny synthetic checkpoints only; see
   [the conversion guide](docs/QWEN38_MOE.md).
-- GGUF read/write (mmap), safetensors, role-tagged IR with MoE detection.
-- Legacy quants (Q4_0/1, Q5_0/1, Q8_0/1) and k-quants (Q4_K, Q5_K, Q6_K) — **bit-exact
-  with ggml 0.11.0** (`llama-quantize`), both the no-imatrix (`_ref`) and imatrix-weighted
-  (`quantize_qX_K(quant_weights)`) paths.
+- GGUF v3 read/write (mmap + streaming), sharded safetensors read, and role-tagged IR with MoE
+  detection. Dense-to-MoE conversion writes sharded safetensors directly.
+- Every quantized tensor type in the current GGML type table: Q1/Q2/Q4/Q5/Q8, all K-quants,
+  all stored I-quants, TQ1/TQ2 ternary, MXFP4, and GGUF NVFP4. The established legacy/K/I
+  kernels are **bit-exact with the pinned ggml oracle**; newer post-oracle types have synthetic
+  layout/quantize/dequantize coverage. See the complete matrix below.
 - imatrix-weighted scale search (the `make_qp_quants` super-block path) — bit-exact with
   ggml's imatrix kernels.
 - Block-alignment fallback matching `llama-quantize` (Q4_K→Q5_0, Q5_K→Q5_1, Q6_K→Q8_0, …)
@@ -42,16 +44,61 @@ See the [design doc](DESIGN.md) for the full thesis, math, and architecture.
   induces. Feeds `search --sensitivity`, replacing the proxy with measurement.
 - `eval` via `llama-perplexity`, with `--kl` for the far more sensitive KL comparison;
   `inspect` for tensor/role/MoE introspection.
-- **Block-scaled floats**: FP4 (E2M1), FP8 (E4M3/E5M2), MXFP4, NVFP4, MXFP8 — read *and*
-  write, including a safetensors reader so an NVFP4 checkpoint can be a source. NVFP4 emit
-  targets the vLLM/ModelOpt checkpoint layout (see `crates/requant-quant/src/mxfp.rs` for the
-  conventions each decision matches).
+- **Block-scaled floats**: FP4 (E2M1), FP8 (E4M3/E5M2), MXFP4, NVFP4, MXFP8. GGUF MXFP4 and
+  NVFP4 are readable/writable; checkpoint layouts have safetensors readers plus grouped library
+  output for vLLM/ModelOpt sidecars (see `crates/requant-quant/src/mxfp.rs` for conventions).
 - Precision **floors** (`[floors]`): the router floor generalised to "no dense-path tensor
   below X", enforced against hand-written and search-emitted recipes alike.
 
-**Not yet (phase 7):** i-quants (IQ1–IQ4), GPTQ, AWQ, NF4, rotation/incoherence. The GGUF
-MXFP4 emit path has not yet been checked against ggml's `quantize_row_mxfp4_ref` (the
-`ggml-oracle-mxfp4` feature exists for it); treat it as unverified until it has.
+**Not implemented:** GPTQ/AWQ algorithms, NF4, HQQ, EXL2, activation quantization, and
+rotation/incoherence transforms. `QuantMethod::Gptq`/`Awq` are reserved recipe vocabulary, not
+working kernels. The GGUF MXFP4 emit path has not yet been checked against ggml's
+`quantize_row_mxfp4_ref` (the `ggml-oracle-mxfp4` feature exists for it); treat its packed-byte
+identity as unverified until that optional oracle is run.
+
+## Quantization and format support
+
+The names below are the exact spellings accepted by recipe `bits = "..."`, explicit search
+ladders, and the library `Bits::from_name` parser. “GGUF R/W” means requant can read, dequantize,
+quantize, and write that tensor type in a GGUF. BPW includes block metadata.
+
+| family | available names | BPW | GGUF R/W | calibration | verification/status |
+|---|---|---:|:---:|---|---|
+| float | `F32`, `F16`/`FP16`, `BF16` | 32, 16, 16 | yes | none | direct conversion/copy |
+| standard Q | `Q1_0`, `Q2_0` | 1.125, 2.25 | yes | none | current GGML reference ports; synthetic tests |
+| legacy Q | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` | 4.5, 5, 5.5, 6, 8.5, 9 | yes | none | packed-byte oracle coverage |
+| K-quant | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K` | 2.625, 3.4375, 4.5, 5.5, 6.5625 | yes | optional imatrix | packed-byte oracle coverage for RTN and weighted kernels |
+| K intermediate | `Q8_K` | 9.125 | yes | none | tensor R/W + kernel support; GGML uses it internally, not as a whole-model preset |
+| I-quant | `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS`, `IQ4_NL` | 1.5625–4.5 | yes | required for `IQ1_S`, `IQ2_XXS`, `IQ2_XS`; optional for the rest | packed-byte/dequant oracle coverage |
+| ternary | `TQ1_0`, `TQ2_0` | 1.6875, 2.0625 | yes | none | current GGML reference ports; synthetic tests |
+| GGUF block float | `MXFP4`, `NVFP4_GGUF`/`GGML_NVFP4` | 4.25, 4.5 | yes | none | synthetic layout/kernel tests; see MXFP4 oracle caveat above |
+| checkpoint block float | `NVFP4`, `MXFP8` | 4.5, 8.25 | no | optional imatrix for NVFP4 scale refinement | library grouped output with sidecar scales; safetensors-oriented |
+| checkpoint dense float | `FP8_E4M3`/`FP8`, `FP8_E5M2` | ~8 | no | none | library grouped output with per-channel scale sidecar |
+
+`NVFP4_GGUF` and `NVFP4` deliberately have different names. Current GGML type 40 stores four
+UE4M3 scales inside each 64-weight block. ModelOpt/vLLM checkpoint NVFP4 stores E2M1 weights,
+an E4M3 `weight_scale`, and an additional FP32 `weight_scale_2` sidecar. Treating them as one
+layout would silently produce incorrect weights.
+
+The `full` search ladder contains every normal low-bit integer/codebook/ternary target from
+`Q1_0` through `Q8_0`; `kquant`, `iquant`, and `blockfloat` select family-specific ladders. Any
+accepted names can also be supplied as a comma-separated custom ladder. `Q8_K` is omitted from
+automatic ladders because it is an intermediate block, while `Q8_0` is the normal high-quality
+endpoint.
+
+Container and checkpoint formats:
+
+| container/layout | read | write | notes |
+|---|:---:|:---:|---|
+| GGUF v3 | yes | yes | mmap reader, regular and streaming writers, quant→quant source dequantization |
+| single/sharded safetensors | yes | converter only | mmap reader and index resolution; `moefy-qwen38` writes native sharded output |
+| safetensors scalar dtypes | yes | passthrough in converter | `BOOL`, `U8`, `I8`, `U16`, `I16`, `U32`, `I32`, `U64`, `I64`, `F16`, `BF16`, `F32`, `F64`, `F8_E4M3`, `F8_E5M2` |
+| ModelOpt/vLLM grouped weights | yes via layout helpers | library output | NVFP4 `(weight, weight_scale, weight_scale_2)` and FP8 `(weight, weight_scale)` |
+
+The compatibility baseline follows the current upstream
+[`enum ggml_type`](https://github.com/ggml-org/llama.cpp/blob/master/ggml/include/ggml.h),
+[`ggml-common.h` block layouts](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h),
+and [`ggml-quants.c` reference kernels](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-quants.c).
 
 ## Quickstart
 
@@ -111,10 +158,9 @@ tensor-by-tensor against ggml's reference kernels:
 cargo test --release -p requant-quant --features ggml-oracle
 ```
 
-16 tests cover legacy + k-quant round-trips and the imatrix-weighted k-quant path
-(`q4_k_imatrix_matches_ref`, `q5_k_imatrix_matches_ref`, `q6_k_imatrix_matches_ref`,
-multi-block and multi-row). Without `--features ggml-oracle` the oracle tests are
-skipped (the feature gates the FFI to libggml).
+45 tests cover legacy, all five output K-quants, all nine I-quants, reference dequantization,
+RTN/null-weight behavior, imatrix-weighted paths, multi-block, and multi-row cases. Without
+`--features ggml-oracle` the oracle tests are skipped (the feature gates the FFI to libggml).
 
 ## Validation: Qwen2.5-0.5B
 
