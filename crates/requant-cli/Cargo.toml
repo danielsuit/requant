@@ -1,0 +1,27 @@
+[package]
+name = "requant-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "requant"
+path = "src/main.rs"
+
+[dependencies]
+requant-io = { workspace = true }
+requant-quant = { workspace = true }
+requant-calib = { workspace = true }
+requant-search = { workspace = true }
+requant-eval = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+requant-io = { workspace = true }
+tempfile = "3"

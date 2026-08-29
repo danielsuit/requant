@@ -1,0 +1,131 @@
+# V4-Flash-class MoE: routed experts in NVFP4 with hot/cold tiering, everything always-on
+# pinned at FP8, router floored.
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# READ THIS FIRST: there is no full-precision master under this recipe.
+#
+# A V4 Flash checkpoint ships in NVFP4. Applying this recipe means going
+# NVFP4 → NVFP4-with-some-experts-lower — quant→quant *inside* the FP4 family, with no fp16
+# weights anywhere in the chain. DESIGN §4 says to warn loudly about exactly this, so:
+#
+#   The allocator will place bits intelligently. It cannot recover signal that was never
+#   stored. Every rule below redistributes existing error; none of it removes error.
+#
+# The only thing that tells you whether the result holds is measurement, and the measurement
+# has to come *before* you trust the output:
+#
+#   requant sensitivity --input <ckpt> --corpus <corpus> -o sens.json --grouping role \
+#       [--logits-dir dumps/]        # if no local runtime implements the architecture
+#   requant search --input <ckpt> --budget <size> --sensitivity sens.json -o v4.toml
+#   requant eval --quant <out> --reference <ckpt> --kl
+#
+# If the measured ΔKL for `routed_expert.* @ MXFP4` is not comfortably below the FP8 dense
+# path's, the hot/cold tiering below is guesswork dressed as policy — replace it with what the
+# sensitivity table actually says.
+# ─────────────────────────────────────────────────────────────────────────────────────────
+#
+# TARGET: a safetensors checkpoint served by vLLM on Blackwell. NVFP4 and dense FP8 have no
+# ggml type, so `requant quantize` will refuse to write these into a GGUF — that refusal is
+# deliberate (see quantize.rs). The point of staying in NVFP4 rather than dropping to GGUF
+# k-quants is the FP4 tensor cores: k-quants fit in memory and then throw the speed away.
+
+[defaults]
+# Anything unclassified lands here. FP8 is the safe default: a tensor we failed to recognise is
+# more likely to be dense-path than expert.
+bits = "FP8_E4M3"
+imatrix = true
+
+# ─── Floors: the hard constraints no rule and no search result may cross (§7.6) ───
+#
+# `router` is the original assertion: quantizing the gate logits corrupts MoE routing in a way
+# perplexity barely registers, so it gets a floor of its own. `dense_path` generalises it to
+# every always-on tensor — attention, shared expert, MTP head, embedding, LM head. Routed
+# experts are the only role exempt, and that exemption is the whole reason the recipe works:
+# each expert sees expert_used/expert_count of the traffic, so a bit spent there buys far less
+# than a bit spent on the dense path.
+[floors]
+router     = "FP8_E4M3"
+dense_path = "FP8_E4M3"
+
+# ─── Dense path: pinned at FP8 ───
+
+# The router, first and explicitly. This rule is redundant with the floor — that is the point.
+# The floor catches mistakes; this rule states the intent.
+[[rule]]
+role = "router"
+bits = "FP8_E4M3"
+
+# Attention is always-on and tolerance-limited.
+[[rule]]
+role = ["attn_q", "attn_k", "attn_v", "attn_o"]
+bits = "FP8_E4M3"
+
+# The shared expert is always-on too — it is an expert only in name.
+[[rule]]
+role = "shared_expert"
+bits = "FP8_E4M3"
+
+# Multi-token-prediction head. It writes into a logit distribution directly, so it is as
+# sensitive as the LM head and belongs here rather than with the experts.
+[[rule]]
+role = "mtp"
+bits = "FP8_E4M3"
+
+# Embeddings and the LM head. Large on a big-vocab model, and the LM head produces the logits
+# every metric is computed from.
+[[rule]]
+role = ["embedding", "lm_head"]
+bits = "FP8_E4M3"
+
+# Dense (non-MoE) FFN blocks, where the architecture has them — typically the first layer or two.
+[[rule]]
+role = ["ffn_gate", "ffn_up", "ffn_down"]
+bits = "FP8_E4M3"
+
+# ─── Routed experts: NVFP4 baseline, with hot/cold tiering ───
+
+# The baseline. NVFP4 (4.5 bpw incl. its E4M3 block scale) is the format the Blackwell FP4
+# tensor cores consume; block 16 with a two-level scale makes it meaningfully more expressive
+# than MXFP4's power-of-two scale over 32.
+[[rule]]
+role = "routed_expert"
+bits = "NVFP4"
+
+# COLD TIER — the middle of the stack, sub-4-bit.
+#
+# Middle layers are where representations are most redundant and where per-expert specialisation
+# is highest, so each individual expert carries the least unique signal. MXFP4 (4.25 bpw) is the
+# sub-NVFP4 rung: same E2M1 elements, coarser scale.
+#
+# This is the single most speculative rule in the file. It is a hypothesis about where the model
+# is redundant, and `requant sensitivity --grouping role-depth:4` tests it directly. Delete this
+# rule if the measured curves disagree.
+[[rule]]
+role  = "routed_expert"
+layer = "0.25..0.70"
+bits  = "MXFP4"
+
+# HOT TIER — the ends of the stack stay at the NVFP4 baseline.
+#
+# Early layers shape everything downstream and late layers feed the head; both compound errors
+# further than the middle does. Re-asserted after the cold rule because rules are
+# last-match-wins.
+[[rule]]
+role  = "routed_expert"
+layer = "< 0.25"
+bits  = "NVFP4"
+
+[[rule]]
+role  = "routed_expert"
+layer = ">= 0.70"
+bits  = "NVFP4"
+
+# HOTTEST — deep down-projections.
+#
+# The down-projection is the one that writes back into the residual stream, so its error lands
+# on every subsequent layer rather than being attenuated by the next nonlinearity. This is the
+# same asymmetry the k-quant default recipe encodes, and it survives the format change.
+[[rule]]
+role  = "routed_expert.down"
+layer = ">= 0.70"
+bits  = "FP8_E4M3"

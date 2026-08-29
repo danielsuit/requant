@@ -1,0 +1,10 @@
+/target/
+/.requant/
+.DS_Store
+
+# Model checkpoints and generated calibration/evaluation artifacts are never source files.
+*.gguf
+*.safetensors
+*.imatrix
+*.logits
+testmodels/

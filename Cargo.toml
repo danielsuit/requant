@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/requant-io",
+    "crates/requant-quant",
+    "crates/requant-calib",
+    "crates/requant-search",
+    "crates/requant-eval",
+    "crates/requant-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/danielsuit/requant"
+
+[workspace.dependencies]
+requant-io     = { path = "crates/requant-io" }
+requant-quant  = { path = "crates/requant-quant" }
+requant-calib  = { path = "crates/requant-calib" }
+requant-search = { path = "crates/requant-search" }
+requant-eval   = { path = "crates/requant-eval" }
+
+half      = "2"
+rayon     = "1"
+memmap2   = "0.9"
+blake3    = "1"
+bytemuck  = "1"
+serde     = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml      = "0.8"
+thiserror = "1"
+anyhow    = "1"
+clap      = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

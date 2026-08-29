@@ -1,0 +1,17 @@
+[package]
+name = "requant-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+requant-io = { workspace = true }
+requant-quant = { workspace = true }
+requant-calib = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,15 @@
+[package]
+name = "requant-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+requant-io = { workspace = true }
+requant-quant = { workspace = true }
+requant-calib = { workspace = true }
+requant-eval = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
