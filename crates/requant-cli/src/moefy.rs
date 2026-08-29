@@ -3,11 +3,11 @@
 //! This is deliberately a *warm-start builder*, not a claim that an untrained router turns a
 //! dense model into a good sparse model. Each dense SwiGLU intermediate dimension is assigned to
 //! exactly one routed expert, preserving the total FFN parameter count. The output has the native
-//! packed expert layout consumed by Transformers' `Qwen3_5MoeExperts`. Router and shared-expert
-//! tensors are zero-initialized, and the manifest marks the checkpoint as requiring router/expert
-//! training before inference.
+//! packed expert layout consumed by Transformers' `Qwen3_5MoeExperts`. Routers are initialized
+//! deterministically, shared-expert tensors are zero-initialized, and the manifest marks the
+//! checkpoint as requiring router/expert training before inference.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,30 @@ use half::{bf16, f16};
 use requant_io::{ShardedSafeTensors, StDtype, TensorSource};
 use serde_json::{json, Map, Value};
 
-const TEXT_LAYER_PREFIX: &str = "model.language_model.layers.";
+const VLM_LAYER_PREFIX: &str = "model.language_model.layers.";
+const TEXT_LAYER_PREFIX: &str = "model.layers.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelFlavor {
+    VisionLanguage,
+    TextOnly,
+}
+
+#[derive(Debug, Clone)]
+struct ConversionProfile {
+    config: Value,
+    flavor: ModelFlavor,
+    source_model_type: String,
+    target_model_type: &'static str,
+    target_architecture: &'static str,
+    layer_prefix: &'static str,
+    n_layers: usize,
+    mtp_layers: usize,
+    hidden: usize,
+    intermediate: usize,
+    initializer_range: f32,
+    configured_layer_types: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct MoefyOptions {
@@ -106,19 +129,14 @@ pub fn run_moefy_qwen38(opts: &MoefyOptions) -> Result<()> {
         .with_context(|| format!("reading {}", config_path.display()))?;
     let config: Value = serde_json::from_str(&config_text)
         .with_context(|| format!("parsing {}", config_path.display()))?;
-    let (new_config, n_layers, mtp_layers, hidden, intermediate) =
-        convert_config(config, opts.experts, opts.top_k)?;
+    let mut profile = convert_config(config, opts.experts, opts.top_k)?;
 
     let source = ShardedSafeTensors::open_dir(input)?;
-    let layers = discover_layers(
-        &source,
-        n_layers,
-        mtp_layers,
-        hidden,
-        intermediate,
-        opts.experts,
-    )?;
-    let tensors = build_output_plan(&source, &layers, opts.experts)?;
+    let attention = audit_attention_layout(&source, &profile)?;
+    set_explicit_layer_types(&mut profile, &attention.kinds);
+    let layers = discover_layers(&source, &profile, opts.experts)?;
+    let tensors = build_output_plan(&source, &layers, opts.experts, profile.initializer_range)?;
+    audit_passthrough_plan(&source, &layers, &tensors)?;
     let input_bytes: u64 = source
         .names()
         .map(|n| {
@@ -130,10 +148,16 @@ pub fn run_moefy_qwen38(opts: &MoefyOptions) -> Result<()> {
         .sum();
     let output_bytes: u64 = tensors.iter().map(|t| t.nbytes).sum();
 
-    println!("Qwen3.8 dense -> Qwen3.5-MoE warm-start plan");
-    println!("  text layers       : {n_layers}");
-    println!("  MTP layers        : {mtp_layers}");
-    println!("  hidden/intermediate: {hidden}/{intermediate}");
+    println!("Qwen3.5-family dense -> Qwen3.5-MoE warm-start plan");
+    println!("  source model type : {}", profile.source_model_type);
+    println!("  target class      : {}", profile.target_architecture);
+    println!("  text layers       : {}", profile.n_layers);
+    println!("  attention layout  : {}", attention.summary());
+    println!("  MTP layers        : {}", profile.mtp_layers);
+    println!(
+        "  hidden/intermediate: {}/{}",
+        profile.hidden, profile.intermediate
+    );
     println!("  experts / top-k   : {} / {}", opts.experts, opts.top_k);
     println!("  expert width      : {}", layers[0].expert_intermediate);
     println!("  tensor bytes      : {input_bytes} -> {output_bytes}");
@@ -157,25 +181,36 @@ pub fn run_moefy_qwen38(opts: &MoefyOptions) -> Result<()> {
         .with_context(|| format!("creating output directory {}", output.display()))?;
     let result = (|| {
         copy_support_files(input, output)?;
-        write_json(output.join("config.json"), &new_config)?;
+        write_json(output.join("config.json"), &profile.config)?;
         write_checkpoint(&source, output, &tensors, max_shard_bytes)?;
         let manifest = json!({
-            "format": "requant-qwen38-dense-to-qwen35-moe-v1",
+            "format": "requant-qwen35-family-dense-to-qwen35-moe-v2",
             "source": input.display().to_string(),
-            "architecture": "Qwen3_5MoeForConditionalGeneration",
+            "source_model_type": profile.source_model_type,
+            "source_flavor": match profile.flavor {
+                ModelFlavor::VisionLanguage => "vision-language",
+                ModelFlavor::TextOnly => "text-only",
+            },
+            "target_model_type": profile.target_model_type,
+            "architecture": profile.target_architecture,
+            "attention_layout": attention.kinds,
             "strategy": "contiguous-neuron-partition",
             "num_experts": opts.experts,
             "num_experts_per_tok": opts.top_k,
-            "dense_intermediate_size": intermediate,
+            "dense_intermediate_size": profile.intermediate,
             "moe_intermediate_size": layers[0].expert_intermediate,
             "shared_expert_intermediate_size": 1,
-        "router_initialization": "deterministic uniform random in [-0.02, 0.02]",
-        "shared_expert_initialization": "zeros",
-        "down_projection_scale": opts.experts,
+            "router_initialization": format!(
+                "deterministic uniform random in [-{}, {}]",
+                profile.initializer_range, profile.initializer_range
+            ),
+            "shared_expert_initialization": "zeros",
+            "down_projection_scale": opts.experts,
             "requires_training": true,
             "inference_ready": false,
             "notes": [
-                "Attention, vision, linear-attention, embeddings, lm_head, and MTP non-MLP tensors are copied byte-for-byte.",
+                "Every non-MLP source tensor is copied byte-for-byte with the same name, dtype, shape, and payload.",
+                "Full attention, linear attention, hybrid layouts, vision attention, and MTP attention are preserved rather than rewritten.",
                 "The MTP MLP is converted to the same packed expert layout as the backbone MLPs.",
                 "Dense SwiGLU neurons are partitioned across routed experts with no duplication.",
                 "Expert down projections are multiplied by num_experts to preserve the dense FFN output in expectation under balanced routing.",
@@ -197,50 +232,103 @@ pub fn run_moefy_qwen38(opts: &MoefyOptions) -> Result<()> {
     Ok(())
 }
 
-fn convert_config(
-    mut config: Value,
-    experts: usize,
-    top_k: usize,
-) -> Result<(Value, usize, usize, usize, usize)> {
+fn convert_config(mut config: Value, experts: usize, top_k: usize) -> Result<ConversionProfile> {
     let root = config
         .as_object_mut()
         .ok_or_else(|| anyhow!("config.json root must be an object"))?;
-    let model_type = root.get("model_type").and_then(Value::as_str).unwrap_or("");
-    if model_type != "qwen3_5" {
-        bail!("expected dense Qwen3.8/Qwen3.5 model_type `qwen3_5`, found `{model_type}`");
+    let source_model_type = root
+        .get("model_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if root.contains_key("quantization_config") {
+        bail!(
+            "quantized source checkpoints are unsupported for dense-to-MoE conversion; use the original BF16/F16/F32 checkpoint"
+        );
     }
-    let text = root
-        .get_mut("text_config")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("config.json is missing object `text_config`"))?;
-    let text_type = text.get("model_type").and_then(Value::as_str).unwrap_or("");
-    if text_type != "qwen3_5_text" {
-        bail!("expected dense text_config.model_type `qwen3_5_text`, found `{text_type}`");
-    }
-    let n_layers = required_usize(text, "num_hidden_layers")?;
+    let flavor = match source_model_type.as_str() {
+        "qwen3_5" => ModelFlavor::VisionLanguage,
+        "qwen3_5_text" => ModelFlavor::TextOnly,
+        other => bail!(
+            "unsupported dense model_type `{other}`. This converter supports the Qwen3.5-family runtime only: `qwen3_5` (multimodal) and `qwen3_5_text` (text-only). Other families need their own target MoE class and expert layout."
+        ),
+    };
+
+    let text: &Map<String, Value> = match flavor {
+        ModelFlavor::VisionLanguage => {
+            let text = root
+                .get("text_config")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow!("multimodal config.json is missing object `text_config`"))?;
+            let text_type = text.get("model_type").and_then(Value::as_str).unwrap_or("");
+            if text_type != "qwen3_5_text" {
+                bail!("expected dense text_config.model_type `qwen3_5_text`, found `{text_type}`");
+            }
+            text
+        }
+        ModelFlavor::TextOnly => root,
+    };
+    let n_layers = required_positive_usize(text, "num_hidden_layers")?;
     let mtp_layers = text
         .get("mtp_num_hidden_layers")
         .and_then(Value::as_u64)
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(0);
-    let hidden = required_usize(text, "hidden_size")?;
-    let intermediate = required_usize(text, "intermediate_size")?;
+    let hidden = required_positive_usize(text, "hidden_size")?;
+    let intermediate = required_positive_usize(text, "intermediate_size")?;
+    let initializer_range = text
+        .get("initializer_range")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.02) as f32;
+    if !initializer_range.is_finite() || initializer_range <= 0.0 {
+        bail!("initializer_range must be a positive finite number");
+    }
+    let configured_layer_types = parse_layer_types(text, n_layers)?;
     if intermediate % experts != 0 {
         bail!(
             "dense intermediate_size {intermediate} is not divisible by {experts} experts; choose a divisor so no neurons are dropped"
         );
     }
 
-    root.insert(
-        "architectures".into(),
-        json!(["Qwen3_5MoeForConditionalGeneration"]),
-    );
-    root.insert("model_type".into(), json!("qwen3_5_moe"));
-    let text = root
-        .get_mut("text_config")
-        .unwrap()
-        .as_object_mut()
-        .unwrap();
+    let (target_model_type, target_architecture, layer_prefix) = match flavor {
+        ModelFlavor::VisionLanguage => (
+            "qwen3_5_moe",
+            "Qwen3_5MoeForConditionalGeneration",
+            VLM_LAYER_PREFIX,
+        ),
+        ModelFlavor::TextOnly => (
+            "qwen3_5_moe_text",
+            "Qwen3_5MoeForCausalLM",
+            TEXT_LAYER_PREFIX,
+        ),
+    };
+    root.insert("architectures".into(), json!([target_architecture]));
+    let text = match flavor {
+        ModelFlavor::VisionLanguage => {
+            root.insert("model_type".into(), json!(target_model_type));
+            let vision = root
+                .get_mut("vision_config")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    anyhow!("multimodal config.json is missing object `vision_config`")
+                })?;
+            let vision_type = vision
+                .get("model_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !matches!(vision_type, "qwen3_5" | "qwen3_5_vision") {
+                bail!("unsupported dense vision_config.model_type `{vision_type}`");
+            }
+            // Match the official Qwen3.5-MoE checkpoint convention. Transformers' outer MoE
+            // config then materializes this dictionary as Qwen3_5MoeVisionConfig.
+            vision.insert("model_type".into(), json!("qwen3_5_moe"));
+            root.get_mut("text_config")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+        }
+        ModelFlavor::TextOnly => root,
+    };
     text.insert("model_type".into(), json!("qwen3_5_moe_text"));
     text.remove("intermediate_size");
     text.insert(
@@ -252,33 +340,170 @@ fn convert_config(
     text.insert("num_experts_per_tok".into(), json!(top_k));
     text.insert("output_router_logits".into(), json!(true));
     text.insert("router_aux_loss_coef".into(), json!(0.001));
-    Ok((config, n_layers, mtp_layers, hidden, intermediate))
+    Ok(ConversionProfile {
+        config,
+        flavor,
+        source_model_type,
+        target_model_type,
+        target_architecture,
+        layer_prefix,
+        n_layers,
+        mtp_layers,
+        hidden,
+        intermediate,
+        initializer_range,
+        configured_layer_types,
+    })
 }
 
-fn required_usize(obj: &Map<String, Value>, key: &str) -> Result<usize> {
-    obj.get(key)
+fn required_positive_usize(obj: &Map<String, Value>, key: &str) -> Result<usize> {
+    let value = obj
+        .get(key)
         .and_then(Value::as_u64)
         .and_then(|v| usize::try_from(v).ok())
-        .ok_or_else(|| anyhow!("text_config.{key} must be a positive integer"))
+        .ok_or_else(|| anyhow!("text config `{key}` must be a positive integer"))?;
+    if value == 0 {
+        bail!("text config `{key}` must be positive");
+    }
+    Ok(value)
+}
+
+fn parse_layer_types(text: &Map<String, Value>, n_layers: usize) -> Result<Option<Vec<String>>> {
+    let Some(value) = text.get("layer_types") else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("layer_types must be an array"))?;
+    if values.len() != n_layers {
+        bail!(
+            "layer_types has {} entries but num_hidden_layers is {n_layers}",
+            values.len()
+        );
+    }
+    let mut out = Vec::with_capacity(n_layers);
+    for (layer, value) in values.iter().enumerate() {
+        let kind = value
+            .as_str()
+            .ok_or_else(|| anyhow!("layer_types[{layer}] must be a string"))?;
+        if !matches!(kind, "full_attention" | "linear_attention") {
+            bail!(
+                "unsupported layer_types[{layer}] `{kind}`; the Qwen3.5-MoE runtime supports `full_attention` and `linear_attention`"
+            );
+        }
+        out.push(kind.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn set_explicit_layer_types(profile: &mut ConversionProfile, kinds: &[String]) {
+    let root = profile.config.as_object_mut().unwrap();
+    let text = match profile.flavor {
+        ModelFlavor::VisionLanguage => root
+            .get_mut("text_config")
+            .unwrap()
+            .as_object_mut()
+            .unwrap(),
+        ModelFlavor::TextOnly => root,
+    };
+    // Persist the audited list even when the source relied on an interval-derived default. This
+    // prevents the target config class from deriving a different hybrid pattern in the future.
+    text.insert("layer_types".into(), json!(kinds));
+}
+
+#[derive(Debug, Clone)]
+struct AttentionAudit {
+    kinds: Vec<String>,
+    full: usize,
+    linear: usize,
+}
+
+impl AttentionAudit {
+    fn summary(&self) -> String {
+        match (self.full, self.linear) {
+            (full, 0) => format!("full attention ({full} layers)"),
+            (0, linear) => format!("linear attention ({linear} layers)"),
+            (full, linear) => {
+                format!("hybrid: {full} full + {linear} linear attention layers")
+            }
+        }
+    }
+}
+
+/// Verify the config's per-layer attention architecture against the checkpoint itself. Attention
+/// is not rewritten by moefication, but silently changing the outer model class is safe only when
+/// the target Qwen3.5-MoE class will instantiate the same block type at every layer.
+fn audit_attention_layout(
+    source: &ShardedSafeTensors,
+    profile: &ConversionProfile,
+) -> Result<AttentionAudit> {
+    let names: Vec<&str> = source.names().collect();
+    let mut kinds = Vec::with_capacity(profile.n_layers);
+    let mut full = 0usize;
+    let mut linear = 0usize;
+    for layer in 0..profile.n_layers {
+        let base = format!("{}{layer}.", profile.layer_prefix);
+        let full_prefix = format!("{base}self_attn.");
+        let linear_prefix = format!("{base}linear_attn.");
+        let has_full = names.iter().any(|name| name.starts_with(&full_prefix));
+        let has_linear = names.iter().any(|name| name.starts_with(&linear_prefix));
+        let actual = match (has_full, has_linear) {
+            (true, false) => "full_attention",
+            (false, true) => "linear_attention",
+            (true, true) => bail!(
+                "layer {layer} contains both `self_attn` and `linear_attn` tensors; refusing an ambiguous architecture conversion"
+            ),
+            (false, false) => bail!(
+                "layer {layer} has neither `self_attn` nor `linear_attn` tensors under `{base}`; the checkpoint does not match the supported Qwen3.5 architecture"
+            ),
+        };
+        if let Some(configured) = &profile.configured_layer_types {
+            if configured[layer] != actual {
+                bail!(
+                    "layer {layer}: config declares `{}`, but checkpoint tensors contain `{actual}`",
+                    configured[layer]
+                );
+            }
+        }
+        match actual {
+            "full_attention" => full += 1,
+            "linear_attention" => linear += 1,
+            _ => unreachable!(),
+        }
+        kinds.push(actual.to_string());
+    }
+    Ok(AttentionAudit {
+        kinds,
+        full,
+        linear,
+    })
 }
 
 fn discover_layers(
     source: &ShardedSafeTensors,
-    n_layers: usize,
-    mtp_layers: usize,
-    hidden: usize,
-    intermediate: usize,
+    profile: &ConversionProfile,
     experts: usize,
 ) -> Result<Vec<DenseLayer>> {
-    let mut prefixes: Vec<String> = (0..n_layers)
-        .map(|layer| format!("{TEXT_LAYER_PREFIX}{layer}.mlp"))
+    let mut prefixes: Vec<String> = (0..profile.n_layers)
+        .map(|layer| format!("{}{layer}.mlp", profile.layer_prefix))
         .collect();
-    prefixes.extend((0..mtp_layers).map(|layer| format!("mtp.layers.{layer}.mlp")));
+    prefixes.extend((0..profile.mtp_layers).map(|layer| format!("mtp.layers.{layer}.mlp")));
     let mut layers = Vec::with_capacity(prefixes.len());
     for prefix in prefixes {
         let gate = format!("{prefix}.gate_proj.weight");
         let up = format!("{prefix}.up_proj.weight");
         let down = format!("{prefix}.down_proj.weight");
+        for bias in [
+            format!("{prefix}.gate_proj.bias"),
+            format!("{prefix}.up_proj.bias"),
+            format!("{prefix}.down_proj.bias"),
+        ] {
+            if source.contains(&bias) {
+                bail!(
+                    "MLP `{prefix}` contains bias tensor `{bias}`, but the Qwen3.5-MoE expert runtime is bias-free"
+                );
+            }
+        }
         let ge = source
             .entry(&gate)
             .ok_or_else(|| anyhow!("missing dense layer tensor `{gate}`"))?;
@@ -297,18 +522,18 @@ fn discover_layers(
                 ge.dtype
             );
         }
-        check_shape(&gate, &ge.shape, &[intermediate, hidden])?;
-        check_shape(&up, &ue.shape, &[intermediate, hidden])?;
-        check_shape(&down, &de.shape, &[hidden, intermediate])?;
+        check_shape(&gate, &ge.shape, &[profile.intermediate, profile.hidden])?;
+        check_shape(&up, &ue.shape, &[profile.intermediate, profile.hidden])?;
+        check_shape(&down, &de.shape, &[profile.hidden, profile.intermediate])?;
         layers.push(DenseLayer {
             prefix,
             gate,
             up,
             down,
             dtype: ge.dtype,
-            hidden,
-            intermediate,
-            expert_intermediate: intermediate / experts,
+            hidden: profile.hidden,
+            intermediate: profile.intermediate,
+            expert_intermediate: profile.intermediate / experts,
         });
     }
     Ok(layers)
@@ -326,6 +551,7 @@ fn build_output_plan(
     source: &ShardedSafeTensors,
     layers: &[DenseLayer],
     experts: usize,
+    initializer_range: f32,
 ) -> Result<Vec<OutputTensor>> {
     let dense_names: BTreeSet<&str> = layers
         .iter()
@@ -389,7 +615,7 @@ fn build_output_plan(
             shape: router_shape,
             payload: Payload::RandomRouter {
                 seed: stable_seed(&l.prefix),
-                amplitude: 0.02,
+                amplitude: initializer_range,
             },
         });
         for (name, shape) in [
@@ -425,6 +651,47 @@ fn build_output_plan(
         }
     }
     Ok(out)
+}
+
+/// Prove that architecture-specific state outside the converted MLP triplets is opaque
+/// passthrough. This covers attention variants without trying to maintain an ever-growing list of
+/// Q/K/V/DeltaNet/vision tensor names.
+fn audit_passthrough_plan(
+    source: &ShardedSafeTensors,
+    layers: &[DenseLayer],
+    output: &[OutputTensor],
+) -> Result<()> {
+    let replaced: BTreeSet<&str> = layers
+        .iter()
+        .flat_map(|l| [l.gate.as_str(), l.up.as_str(), l.down.as_str()])
+        .collect();
+    let by_name: BTreeMap<&str, &OutputTensor> = output
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
+    for name in source.names() {
+        if replaced.contains(name) {
+            if by_name.contains_key(name) {
+                bail!("dense MLP source tensor `{name}` was not removed from the output plan");
+            }
+            continue;
+        }
+        let input = source.entry(name).unwrap();
+        let planned = by_name
+            .get(name)
+            .ok_or_else(|| anyhow!("non-MLP tensor `{name}` is missing from the output plan"))?;
+        match &planned.payload {
+            Payload::Copy { source } if source == name => {}
+            _ => bail!("non-MLP tensor `{name}` is not planned as byte-for-byte passthrough"),
+        }
+        if planned.dtype != input.dtype
+            || planned.shape != input.shape
+            || planned.nbytes != (input.end - input.start) as u64
+        {
+            bail!("non-MLP tensor `{name}` changed dtype, shape, or byte length in the plan");
+        }
+    }
+    Ok(())
 }
 
 fn write_checkpoint(
@@ -711,6 +978,75 @@ mod tests {
             .collect()
     }
 
+    fn validate_config_with_transformers(output: &Path, expected_outer: &str, expected_text: &str) {
+        let available = std::process::Command::new("python3")
+            .args(["-c", "import transformers"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+        let script = r#"
+import sys
+from transformers import AutoConfig
+cfg = AutoConfig.from_pretrained(sys.argv[1], local_files_only=True)
+assert cfg.model_type == sys.argv[2], (cfg.model_type, sys.argv[2])
+text = getattr(cfg, 'text_config', cfg)
+assert text.model_type == sys.argv[3], (text.model_type, sys.argv[3])
+"#;
+        let status = std::process::Command::new("python3")
+            .args([
+                "-c",
+                script,
+                output.to_str().unwrap(),
+                expected_outer,
+                expected_text,
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "Transformers rejected converted config");
+    }
+
+    fn add_qwen_attention_tensors(
+        owned: &mut Vec<(String, &str, Vec<u64>, Vec<u8>)>,
+        layer_prefix: &str,
+    ) {
+        let mut base = 7000u16;
+        let mut add = |name: String| {
+            owned.push((name, "BF16", vec![2, 2], bf16_seq(4, base)));
+            base += 10;
+        };
+        for suffix in [
+            "in_proj_qkv.weight",
+            "in_proj_z.weight",
+            "in_proj_a.weight",
+            "in_proj_b.weight",
+            "conv1d.weight",
+            "dt_bias",
+            "A_log",
+            "norm.weight",
+            "out_proj.weight",
+        ] {
+            add(format!("{layer_prefix}0.linear_attn.{suffix}"));
+        }
+        for suffix in [
+            "q_proj.weight",
+            "k_proj.weight",
+            "v_proj.weight",
+            "o_proj.weight",
+            "q_norm.weight",
+            "k_norm.weight",
+        ] {
+            add(format!("{layer_prefix}1.self_attn.{suffix}"));
+        }
+        add("model.visual.blocks.0.attn.qkv.weight".into());
+        add("model.visual.blocks.0.attn.proj.weight".into());
+        add("mtp.layers.0.self_attn.q_proj.weight".into());
+        add("mtp.layers.0.self_attn.k_proj.weight".into());
+        add("mtp.layers.0.self_attn.v_proj.weight".into());
+        add("mtp.layers.0.self_attn.o_proj.weight".into());
+    }
+
     fn fixture(dir: &Path) {
         let config = json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -730,19 +1066,19 @@ mod tests {
         let mut owned = Vec::new();
         for layer in 0..2 {
             owned.push((
-                format!("{TEXT_LAYER_PREFIX}{layer}.mlp.gate_proj.weight"),
+                format!("{VLM_LAYER_PREFIX}{layer}.mlp.gate_proj.weight"),
                 "BF16",
                 vec![8, 4],
                 bf16_seq(32, 1000 + layer * 100),
             ));
             owned.push((
-                format!("{TEXT_LAYER_PREFIX}{layer}.mlp.up_proj.weight"),
+                format!("{VLM_LAYER_PREFIX}{layer}.mlp.up_proj.weight"),
                 "BF16",
                 vec![8, 4],
                 bf16_seq(32, 2000 + layer * 100),
             ));
             owned.push((
-                format!("{TEXT_LAYER_PREFIX}{layer}.mlp.down_proj.weight"),
+                format!("{VLM_LAYER_PREFIX}{layer}.mlp.down_proj.weight"),
                 "BF16",
                 vec![4, 8],
                 bf16_seq(32, 3000 + layer * 100),
@@ -772,6 +1108,51 @@ mod tests {
             vec![3, 4],
             bf16_seq(12, 50),
         ));
+        add_qwen_attention_tensors(&mut owned, VLM_LAYER_PREFIX);
+        let borrowed: Vec<(&str, &str, Vec<u64>, Vec<u8>)> = owned
+            .iter()
+            .map(|(n, d, s, b)| (n.as_str(), *d, s.clone(), b.clone()))
+            .collect();
+        fs::write(dir.join("model.safetensors"), safetensors(&borrowed)).unwrap();
+    }
+
+    fn text_fixture(dir: &Path) {
+        let config = json!({
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 2,
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "initializer_range": 0.01,
+            "layer_types": ["linear_attention", "full_attention"]
+        });
+        write_json(dir.join("config.json"), &config).unwrap();
+        let mut owned = Vec::new();
+        for layer in 0..2 {
+            owned.push((
+                format!("{TEXT_LAYER_PREFIX}{layer}.mlp.gate_proj.weight"),
+                "BF16",
+                vec![8, 4],
+                bf16_seq(32, 1000 + layer * 100),
+            ));
+            owned.push((
+                format!("{TEXT_LAYER_PREFIX}{layer}.mlp.up_proj.weight"),
+                "BF16",
+                vec![8, 4],
+                bf16_seq(32, 2000 + layer * 100),
+            ));
+            owned.push((
+                format!("{TEXT_LAYER_PREFIX}{layer}.mlp.down_proj.weight"),
+                "BF16",
+                vec![4, 8],
+                bf16_seq(32, 3000 + layer * 100),
+            ));
+        }
+        add_qwen_attention_tensors(&mut owned, TEXT_LAYER_PREFIX);
+        // Text-only checkpoints do not carry vision or MTP; remove those helper entries.
+        owned.retain(|(name, _, _, _)| {
+            !name.starts_with("model.visual.") && !name.starts_with("mtp.")
+        });
         let borrowed: Vec<(&str, &str, Vec<u64>, Vec<u8>)> = owned
             .iter()
             .map(|(n, d, s, b)| (n.as_str(), *d, s.clone(), b.clone()))
@@ -800,12 +1181,13 @@ mod tests {
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
         assert_eq!(cfg["model_type"], "qwen3_5_moe");
         assert_eq!(cfg["text_config"]["model_type"], "qwen3_5_moe_text");
+        assert_eq!(cfg["vision_config"]["model_type"], "qwen3_5_moe");
         assert_eq!(cfg["text_config"]["num_experts"], 2);
         assert_eq!(cfg["text_config"]["moe_intermediate_size"], 4);
         assert!(cfg["text_config"].get("intermediate_size").is_none());
 
         let out = ShardedSafeTensors::open_dir(&output).unwrap();
-        let p = format!("{TEXT_LAYER_PREFIX}0.mlp");
+        let p = format!("{VLM_LAYER_PREFIX}0.mlp");
         let gu = out.entry(&format!("{p}.experts.gate_up_proj")).unwrap();
         assert_eq!(gu.shape, vec![2, 8, 4]);
         let down = out.entry(&format!("{p}.experts.down_proj")).unwrap();
@@ -824,6 +1206,23 @@ mod tests {
                 .unwrap(),
             bf16_seq(12, 50)
         );
+        for name in [
+            format!("{VLM_LAYER_PREFIX}0.linear_attn.in_proj_qkv.weight"),
+            format!("{VLM_LAYER_PREFIX}0.linear_attn.conv1d.weight"),
+            format!("{VLM_LAYER_PREFIX}1.self_attn.q_proj.weight"),
+            format!("{VLM_LAYER_PREFIX}1.self_attn.q_norm.weight"),
+            "model.visual.blocks.0.attn.qkv.weight".into(),
+            "mtp.layers.0.self_attn.o_proj.weight".into(),
+        ] {
+            assert_eq!(
+                out.bytes(&name).unwrap(),
+                ShardedSafeTensors::open_dir(&input)
+                    .unwrap()
+                    .bytes(&name)
+                    .unwrap(),
+                "{name} must pass through byte-for-byte"
+            );
+        }
 
         let gate = bf16_seq(32, 1000);
         let up = bf16_seq(32, 2000);
@@ -859,6 +1258,7 @@ mod tests {
             .unwrap()["inference_ready"],
             false
         );
+        validate_config_with_transformers(&output, "qwen3_5_moe", "qwen3_5_moe_text");
 
         // When the reference Python package is available, validate every generated shard with an
         // implementation independent of requant's reader. Environments without it still run all
@@ -889,6 +1289,34 @@ assert count > 0
                 "Python safetensors rejected generated shards"
             );
         }
+    }
+
+    #[test]
+    fn converts_text_only_full_and_linear_attention_architecture() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("dense-text");
+        let output = temp.path().join("moe-text");
+        fs::create_dir(&input).unwrap();
+        text_fixture(&input);
+        run_moefy_qwen38(&MoefyOptions {
+            input_dir: input.display().to_string(),
+            output_dir: output.display().to_string(),
+            experts: 2,
+            top_k: 1,
+            max_shard_size: "1M".into(),
+            dry_run: false,
+        })
+        .unwrap();
+
+        let cfg: Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(cfg["model_type"], "qwen3_5_moe_text");
+        assert_eq!(cfg["architectures"][0], "Qwen3_5MoeForCausalLM");
+        let out = ShardedSafeTensors::open_dir(&output).unwrap();
+        assert!(out.contains("model.layers.0.mlp.experts.gate_up_proj"));
+        assert!(out.contains("model.layers.0.linear_attn.in_proj_qkv.weight"));
+        assert!(out.contains("model.layers.1.self_attn.q_proj.weight"));
+        validate_config_with_transformers(&output, "qwen3_5_moe_text", "qwen3_5_moe_text");
     }
 
     #[test]
@@ -925,9 +1353,160 @@ assert count > 0
     }
 
     #[test]
+    fn rejects_unsupported_model_families_instead_of_corrupting_attention() {
+        let llama = json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "num_hidden_layers": 2,
+            "hidden_size": 4,
+            "intermediate_size": 8
+        });
+        let error = convert_config(llama, 2, 1).unwrap_err().to_string();
+        assert!(
+            error.contains("unsupported dense model_type `llama`"),
+            "{error}"
+        );
+        assert!(error.contains("target MoE class"), "{error}");
+    }
+
+    #[test]
+    fn rejects_quantized_source_config_before_rewriting() {
+        let config = json!({
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 2,
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "quantization_config": {"quant_method": "fp8"}
+        });
+        let error = convert_config(config, 2, 1).unwrap_err().to_string();
+        assert!(error.contains("quantized source checkpoints"), "{error}");
+    }
+
+    #[test]
+    fn rejects_attention_config_tensor_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("dense");
+        fs::create_dir(&input).unwrap();
+        fixture(&input);
+        let mut config: Value =
+            serde_json::from_slice(&fs::read(input.join("config.json")).unwrap()).unwrap();
+        config["text_config"]["layer_types"] = json!(["full_attention", "full_attention"]);
+        write_json(input.join("config.json"), &config).unwrap();
+
+        let error = run_moefy_qwen38(&MoefyOptions {
+            input_dir: input.display().to_string(),
+            output_dir: temp.path().join("unused").display().to_string(),
+            experts: 2,
+            top_k: 1,
+            max_shard_size: "1M".into(),
+            dry_run: true,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("config declares `full_attention`"),
+            "{error}"
+        );
+        assert!(error.contains("linear_attention"), "{error}");
+    }
+
+    #[test]
+    fn infers_and_persists_attention_layout_when_config_omits_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("dense-text");
+        let output = temp.path().join("moe-text");
+        fs::create_dir(&input).unwrap();
+        text_fixture(&input);
+        let mut config: Value =
+            serde_json::from_slice(&fs::read(input.join("config.json")).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("layer_types");
+        write_json(input.join("config.json"), &config).unwrap();
+
+        run_moefy_qwen38(&MoefyOptions {
+            input_dir: input.display().to_string(),
+            output_dir: output.display().to_string(),
+            experts: 2,
+            top_k: 1,
+            max_shard_size: "1M".into(),
+            dry_run: false,
+        })
+        .unwrap();
+        let converted: Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            converted["layer_types"],
+            json!(["linear_attention", "full_attention"])
+        );
+    }
+
+    #[test]
     fn parses_binary_shard_sizes() {
         assert_eq!(parse_size("5G").unwrap(), 5 * 1024u64.pow(3));
         assert_eq!(parse_size("750MiB").unwrap(), 750 * 1024u64.pow(2));
         assert!(parse_size("1T").is_err());
+    }
+
+    #[test]
+    fn transformers_dense_and_moe_non_mlp_state_dicts_match() {
+        let available = std::process::Command::new("python3")
+            .args(["-c", "import torch, transformers"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            return;
+        }
+        // Instantiate tiny synthetic dense/MoE pairs from the installed Transformers runtime.
+        // This checks full attention (including GQA), linear attention, vision, embeddings, norms,
+        // and heads without downloading or loading any checkpoint weights.
+        let script = r#"
+from transformers import (
+    Qwen3_5Config, Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeTextConfig, Qwen3_5MoeVisionConfig, Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
+
+text_common = dict(
+    hidden_size=8, num_hidden_layers=2, num_attention_heads=2,
+    num_key_value_heads=1, head_dim=4, linear_num_key_heads=2,
+    linear_num_value_heads=2, linear_key_head_dim=4, linear_value_head_dim=4,
+    vocab_size=16, layer_types=['linear_attention', 'full_attention'],
+)
+dense_text = Qwen3_5TextConfig(intermediate_size=8, **text_common)
+moe_text = Qwen3_5MoeTextConfig(
+    moe_intermediate_size=4, shared_expert_intermediate_size=1,
+    num_experts=2, num_experts_per_tok=1, **text_common,
+)
+
+def non_mlp(model):
+    return {k: tuple(v.shape) for k, v in model.state_dict().items() if '.mlp.' not in k}
+
+assert non_mlp(Qwen3_5ForCausalLM(dense_text)) == non_mlp(Qwen3_5MoeForCausalLM(moe_text))
+
+vision_common = dict(
+    hidden_size=4, intermediate_size=8, depth=1, num_heads=1,
+    out_hidden_size=8, patch_size=2, spatial_merge_size=2,
+    temporal_patch_size=1, num_position_embeddings=16,
+)
+dense_vlm = Qwen3_5Config(
+    text_config=dense_text, vision_config=Qwen3_5VisionConfig(**vision_common),
+    image_token_id=8, video_token_id=9, vision_start_token_id=10, vision_end_token_id=11,
+)
+moe_vlm = Qwen3_5MoeConfig(
+    text_config=moe_text, vision_config=Qwen3_5MoeVisionConfig(**vision_common),
+    image_token_id=8, video_token_id=9, vision_start_token_id=10, vision_end_token_id=11,
+)
+assert non_mlp(Qwen3_5ForConditionalGeneration(dense_vlm)) == non_mlp(
+    Qwen3_5MoeForConditionalGeneration(moe_vlm)
+)
+"#;
+        let status = std::process::Command::new("python3")
+            .args(["-c", script])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "Transformers dense/MoE non-MLP state dicts differ"
+        );
     }
 }

@@ -1,9 +1,9 @@
 # Qwen3.8-27B dense-to-MoE warm start
 
-`requant moefy-qwen38` restructures the official BF16/F16/F32 Hugging Face checkpoint into the
-native packed-expert layout used by Transformers' `Qwen3_5MoeForConditionalGeneration`. It does
-not download weights, and it does not pretend that structural conversion alone produces a useful
-MoE. The output is a training warm start.
+`requant moefy-qwen38` restructures official BF16/F16/F32 Qwen3.5-family Hugging Face checkpoints
+into the native packed-expert layout used by Transformers' Qwen3.5-MoE text and multimodal model
+classes. It does not download weights, and it does not pretend that structural conversion alone
+produces a useful MoE. The output is a training warm start.
 
 The converter follows the official architecture definitions:
 
@@ -12,6 +12,39 @@ The converter follows the official architecture definitions:
   and one MTP layer.
 - [Transformers Qwen3.5-MoE implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py): packed
   `experts.gate_up_proj`, packed `experts.down_proj`, a top-k router, and a shared expert.
+
+## Compatibility boundary
+
+The command supports both official dense Qwen3.5-family model architectures used by Qwen3.5,
+Qwen3.6, and Qwen3.8 checkpoints:
+
+| Source config | Source class | Target class | Layer prefix |
+|---|---|---|---|
+| `qwen3_5` | `Qwen3_5ForConditionalGeneration` | `Qwen3_5MoeForConditionalGeneration` | `model.language_model.layers.*` |
+| `qwen3_5_text` | `Qwen3_5ForCausalLM` | `Qwen3_5MoeForCausalLM` | `model.layers.*` |
+
+Within those architectures it supports every attention layout implemented by the official
+Qwen3.5-MoE runtime:
+
+- all-full-attention, all-linear-attention, and arbitrary hybrid `layer_types` layouts;
+- MHA and GQA head configurations, attention output gates, RoPE/mRoPE configuration, and runtime
+  eager/SDPA/Flash Attention selection;
+- gated DeltaNet linear-attention tensors, including projections, convolution, normalization,
+  decay, and time-step parameters;
+- multimodal vision attention and MTP attention.
+
+The converter proves the boundary instead of maintaining a fragile list of attention tensor
+names. It verifies each layer's declared `layer_types` value against the actual `self_attn` or
+`linear_attn` tensor namespace, persists the audited list in the target config, and requires every
+non-MLP source tensor to remain a byte-for-byte passthrough with the same name, dtype, shape, and
+length. Current Transformers synthetic-model tests independently confirm that dense and MoE
+Qwen3.5 text and multimodal classes have identical non-MLP state-dict names and shapes.
+
+This is deliberately not advertised as a universal dense-to-MoE converter. Llama, Mistral,
+Mixtral, Gemma, Phi, Qwen2/Qwen3, DeepSeek, encoder-decoder, fused-MLP, and other model families
+have different target model classes, config contracts, expert layouts, or no compatible MoE
+runtime at all. They are rejected before any output is written rather than being relabeled as
+Qwen3.5 and silently corrupted.
 
 ## What the conversion does
 
@@ -82,6 +115,9 @@ running it as a finished inference model before that training step is expected t
 The repository tests construct tiny synthetic sharded safetensors checkpoints and verify:
 
 - config migration and MTP conversion;
+- multimodal and text-only model-class migration;
+- full-attention, linear-attention, GQA, vision-attention, and MTP-attention passthrough;
+- config/tensor mismatch and unsupported-family rejection;
 - packed gate/up and down layouts byte-for-byte;
 - deterministic nonzero routers and zero shared experts;
 - down-projection scaling;

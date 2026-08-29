@@ -16,9 +16,11 @@ See the [design doc](DESIGN.md) for the full thesis, math, and architecture.
 ## Status
 
 **Implemented and verified:**
-- **Qwen3.8-27B dense-to-MoE warm-start conversion** (`moefy-qwen38`): streaming sharded
-  safetensors rewrite into native Qwen3.5-MoE packed experts, including the MTP MLP, deterministic
-  router initialization, expected-output scaling, config migration, and a fail-loud
+- **Qwen3.5-family dense-to-MoE warm-start conversion** (`moefy-qwen38`), including Qwen3.8-27B:
+  streaming sharded safetensors rewrite into native Qwen3.5-MoE packed experts for both text-only
+  and multimodal model classes. Full/linear/hybrid attention, GQA/MHA, vision, and MTP state pass
+  through byte-for-byte; config/tensor mismatches and other model families fail closed. Includes
+  deterministic router initialization, expected-output scaling, config migration, and a fail-loud
   `requires_training` manifest. Tests use tiny synthetic checkpoints only; see
   [the conversion guide](docs/QWEN38_MOE.md).
 - GGUF read/write (mmap), safetensors, role-tagged IR with MoE detection.

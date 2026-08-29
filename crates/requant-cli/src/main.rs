@@ -124,7 +124,7 @@ enum Cmd {
         #[arg(long, short)]
         input: String,
     },
-    /// Convert a dense Qwen3.8-27B-style safetensors checkpoint into a trainable Qwen3.5-MoE warm start.
+    /// Convert a dense Qwen3.5-family checkpoint (including Qwen3.8) into a trainable Qwen3.5-MoE warm start.
     MoefyQwen38 {
         /// Dense Hugging Face checkpoint directory.
         #[arg(long)]
