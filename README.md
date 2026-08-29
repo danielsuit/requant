@@ -23,6 +23,14 @@ See the [design doc](DESIGN.md) for the full thesis, math, and architecture.
   deterministic router initialization, expected-output scaling, config migration, and a fail-loud
   `requires_training` manifest. Tests use tiny synthetic checkpoints only; see
   [the conversion guide](docs/QWEN38_MOE.md).
+- **Qwen3.5-MoE inference packs** (`pack-qwen35`): quantize a Qwen3.5-MoE checkpoint in place in
+  sharded safetensors — routed experts to Q4_K, attention/embeddings/LM head to Q6_K, the router
+  and norms left BF16 — with a `minglang_pack.json` sidecar carrying each tensor's logical shape
+  and block format (safetensors has no dtype that means "Q4_K"). Row lengths that are not
+  block-aligned take the `llama-quantize` fallback rule rather than failing: `moe_intermediate_size
+  = 544` puts `down_proj` on Q5_0. On Qwen3.8-27B this is 55.6 GB -> 19.6 GB, which is what moves
+  the model into a 23 GB box's page cache. Streams row-chunk at a time, so the tool's own RSS never
+  competes with the cache it is making room for.
 - GGUF v3 read/write (mmap + streaming), sharded safetensors read, and role-tagged IR with MoE
   detection. Dense-to-MoE conversion writes sharded safetensors directly.
 - Every quantized tensor type in the current GGML type table: Q1/Q2/Q4/Q5/Q8, all K-quants,

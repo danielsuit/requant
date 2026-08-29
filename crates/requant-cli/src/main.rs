@@ -145,6 +145,31 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Quantize a Qwen3.5-MoE checkpoint into a minglang inference pack (sharded safetensors
+    /// of raw ggml block bytes plus a `minglang_pack.json` manifest).
+    PackQwen35 {
+        /// Qwen3.5-MoE checkpoint directory, as produced by `moefy-qwen38`.
+        #[arg(long)]
+        input_dir: String,
+        /// New pack directory (must not already exist).
+        #[arg(long)]
+        output_dir: String,
+        /// Type for the routed experts. `down_proj` falls back to Q5_0 (cols 544).
+        #[arg(long, default_value = "Q4_K")]
+        experts: String,
+        /// Type for every attention projection on all layers.
+        #[arg(long, default_value = "Q6_K")]
+        attention: String,
+        /// Type for the token embeddings and the LM head.
+        #[arg(long, default_value = "Q6_K")]
+        embeddings: String,
+        /// Maximum output shard size, e.g. 5G or 750M.
+        #[arg(long, default_value = "5G")]
+        max_shard_size: String,
+        /// Print the size table without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -250,6 +275,23 @@ fn main() -> Result<()> {
             experts,
             top_k,
             max_shard_size,
+            dry_run,
+        }),
+        Cmd::PackQwen35 {
+            input_dir,
+            output_dir,
+            experts,
+            attention,
+            embeddings,
+            max_shard_size,
+            dry_run,
+        } => requant_cli::run_pack_qwen35(&requant_cli::PackOptions {
+            input_dir,
+            output_dir,
+            expert_type: requant_cli::parse_pack_type(&experts)?,
+            attn_type: requant_cli::parse_pack_type(&attention)?,
+            embed_type: requant_cli::parse_pack_type(&embeddings)?,
+            max_shard_size: requant_cli::parse_pack_size(&max_shard_size)?,
             dry_run,
         }),
     }
